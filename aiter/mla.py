@@ -226,6 +226,8 @@ def mla_decode_fwd(
         if nhead in [8, 16] and max_seqlen_q == 1:
             MAYBE_FINAL_OUT = False
 
+        _is_gfx1250 = get_gfx() == "gfx1250"
+
         logits = (
             o.view((total_s, num_kv_splits, nhead, v_head_dim))
             if (
@@ -238,6 +240,7 @@ def mla_decode_fwd(
                         and kv_buffer.dtype == dtypes.bf16
                         and nhead == 32
                     )
+                    or _is_gfx1250
                 )
             )
             else torch.empty(
@@ -278,6 +281,11 @@ def mla_decode_fwd(
             q_scale,
             kv_scale,
         )
+
+        if _is_gfx1250:
+            if final_lse is not None and num_kv_splits == 1:
+                final_lse.copy_(attn_lse[:, 0, :, 0])
+            return logits, final_lse if return_lse else None
 
         if num_kv_splits == 1 and (
             q.dtype == dtypes.fp8
