@@ -260,21 +260,27 @@ def mla_decode_fwd(
             and not _is_gfx1250
         )
 
+        # gfx1250 (mi400) stage1 asm kernel may not write every element of the
+        # split buffers (e.g. OOB page padding), and the downstream finiteness
+        # check inspects the full logits/lse tensors. Zero-initialize on gfx1250
+        # so uninitialized memory cannot surface as transient NaN/Inf; other
+        # archs keep torch.empty to avoid the memset cost.
+        _alloc_split = torch.zeros if _is_gfx1250 else torch.empty
         logits = (
             o.view((total_s, num_kv_splits, nhead, v_head_dim))
             if _can_alias_o_as_logits
-            else torch.empty(
+            else _alloc_split(
                 (total_s, num_kv_splits, nhead, v_head_dim),
                 dtype=dtypes.fp32,
                 device=device,
             )
         )
 
-        attn_lse = torch.empty(
+        attn_lse = _alloc_split(
             (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
         )
         final_lse = (
-            torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+            _alloc_split((total_s, nhead), dtype=dtypes.fp32, device=device)
             if return_lse
             else None
         )

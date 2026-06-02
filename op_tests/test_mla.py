@@ -285,7 +285,10 @@ def _make_mla_mi400_case(
         v_head_dim,
         qk_head_dim - v_head_dim,
     )
-    out = torch.empty(
+    # Zero-initialized (not torch.empty): the gfx1250 stage2 copies splitData
+    # into out, but a zeroed buffer keeps the finiteness check robust against any
+    # element the kernel/stage2 leaves untouched.
+    out = torch.zeros(
         (batch * q_seq_len, nhead, v_head_dim), dtype=torch.bfloat16, device=device
     )
 
@@ -367,123 +370,6 @@ def _cosine_diff(actual, expected):
     return (1 - (numerator / denominator)).item()
 
 
-def _call_mla_mi400(case, *, return_lse):
-    return aiter.mla.mla_decode_fwd(
-        case["q"],
-        case["kv_buffer"],
-        case["out"],
-        case["qo_indptr"],
-        case["kv_indptr"],
-        case["kv_indices"],
-        case["kv_last_page_lens"],
-        case["q_seq_len"],
-        case["page_size"],
-        case["nhead_kv"],
-        1.0 / (case["qk_head_dim"] ** 0.5),
-        num_kv_splits=case["num_kv_splits"],
-        num_kv_splits_indptr=case["num_kv_splits_indptr"],
-        q_scale=case["q_scale"],
-        kv_scale=case["kv_scale"],
-        return_lse=return_lse,
-    )
-
-
-def _mla_mi400_decode_check(
-    *, nhead, decode_qlen, batch, ctx_len, return_lse=False, cos_threshold=5e-2
-):
-    # cos_threshold is a touch looser than the generic fp8 3e-2 tolerance: with
-    # page shuffle + OOB + non-unit scales all on, short-KV / multi-batch combos
-    # (e.g. q4, batch=2, ctx=65) sit just above 3e-2 from fp8 quant noise.
-    # mi400 fp8 MLA decode numeric check for a single driver combo. The dispatch
-    # key is (gqa_ratio, q_seq_len) == (nhead, decode_qlen). Combos with no
-    # registered variant are unsupported, and WIP variants are skipped; both
-    # are recorded as skipped (not failures) so the driver does not abort.
-    ret = {
-        "mi400:nhead": nhead,
-        "mi400:decode_qlen": decode_qlen,
-        "mi400:batch": batch,
-        "mi400:ctx": ctx_len,
-        "mi400:skipped": True,
-        "mi400:passed": None,
-        "mi400:finite": None,
-        "mi400:cos_diff": None,
-    }
-
-    variant = _MI400_VARIANT_BY_KEY.get((nhead, decode_qlen))
-    if variant is None:
-        ret["mi400:reason"] = "unsupported (gqa,qseq)"
-        aiter.logger.info(
-            "mla_decode-mi400 [gqa=%d q=%d]: skipped (unsupported dispatch combo)",
-            nhead,
-            decode_qlen,
-        )
-        return ret
-    if variant.wip:
-        ret["mi400:variant"] = variant.name
-        ret["mi400:reason"] = "WIP"
-        aiter.logger.info(
-            "mla_decode-mi400 [%s]: skipped (WIP, stage1 not yet reconciled "
-            "with poc_kl golden)",
-            variant.name,
-        )
-        return ret
-
-    ret["mi400:variant"] = variant.name
-    ret["mi400:skipped"] = False
-    # mi400-specific coverage knobs are fixed fully-on (page shuffle + OOB
-    # padding + non-unit scales) for every supported combo.
-    case = _make_mla_mi400_case(
-        batch=batch,
-        kv_seq_len=ctx_len,
-        gqa_ratio=nhead,
-        q_seq_len=decode_qlen,
-    )
-
-    # Single launch for functional/numerical validation. run_perftest would
-    # launch the kernel ~100x which, with the current temporary PyTorch stage2,
-    # can leave non-finite values in out.
-    attn_logits, attn_lse = _call_mla_mi400(case, return_lse=True)
-    out_check = case["out"].clone()
-
-    out_shape = (case["batch"] * case["q_seq_len"], case["nhead"], case["v_head_dim"])
-    logits_shape = (
-        case["batch"] * case["q_seq_len"],
-        case["num_kv_splits"],
-        case["nhead"],
-        case["v_head_dim"],
-    )
-    # Structural shape checks are hard asserts: they must always hold.
-    assert out_check.shape == out_shape
-    assert attn_logits.shape == logits_shape
-    assert attn_lse.shape == (case["batch"] * case["q_seq_len"], case["nhead"])
-
-    finite = (
-        torch.isfinite(out_check.detach().float().cpu()).all().item()
-        and torch.isfinite(attn_logits.detach().float().cpu()).all().item()
-        and torch.isfinite(attn_lse.detach().float().cpu()).all().item()
-    )
-    if finite:
-        expected = _ref_mla_mi400(case)
-        cos_diff = _cosine_diff(out_check, expected)
-    else:
-        cos_diff = float("inf")
-
-    passed = finite and cos_diff < cos_threshold
-    ret["mi400:finite"] = finite
-    ret["mi400:cos_diff"] = cos_diff
-    ret["mi400:passed"] = passed
-    aiter.logger.info(
-        "mla_decode-mi400 [%s | batch=%d ctx=%d]: finite=%s cos_diff=%.3e %s",
-        variant.name,
-        batch,
-        ctx_len,
-        finite,
-        cos_diff,
-        "passed" if passed else "FAILED",
-    )
-    return ret
-
-
 @benchmark()
 def test_mla(
     ctx_lens,
@@ -503,18 +389,6 @@ def test_mla(
     mi400=False,
 ):
     ret = {}
-
-    # mi400 (gfx1250) MLA decode is a distinct fp8 + rope-split2 packed layout
-    # with its own PyTorch reference, so it bypasses the standard prefill/decode
-    # paths entirely and routes through the dedicated mi400 numeric check.
-    if mi400:
-        return _mla_mi400_decode_check(
-            nhead=nhead,
-            decode_qlen=decode_qlen,
-            batch=batch_size,
-            ctx_len=ctx_lens,
-            return_lse=return_lse,
-        )
 
     kv_max_sz = (
         65536 * 32
@@ -544,9 +418,15 @@ def test_mla(
     max_seqlen_kv = seq_lens_kv.max().item()
     total_qo = qo_indptr[-1].item()
     total_kv = kv_indptr[-1].item()
-    kv_buffer = torch.randn(
-        (num_page * page_size, 1, kv_lora_rank + qk_rope_head_dim),
-        dtype=torch.bfloat16,
+    # mi400 builds its own fp8 + rope-split2 packed KV inside
+    # test_absorb_decode_mi400(); skip the large standard bf16 KV allocation.
+    kv_buffer = (
+        None
+        if mi400
+        else torch.randn(
+            (num_page * page_size, 1, kv_lora_rank + qk_rope_head_dim),
+            dtype=torch.bfloat16,
+        )
     )
 
     # for none absorb (mha)
@@ -718,19 +598,21 @@ def test_mla(
     total_q = qo_indptr[-1].item()
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
 
-    # troch implementation
-    out_ref, lse_ref = torch_mla_extend(
-        q,
-        kv_buffer,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        sm_scale,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        is_causal=True,
-        dtype=out_dtype,
-    )
+    # troch implementation. mi400 uses its own _ref_mla_mi400 golden (built on
+    # fp8-dequantized, page-gathered inputs), so skip the standard bf16 ref.
+    if not mi400:
+        out_ref, lse_ref = torch_mla_extend(
+            q,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            is_causal=True,
+            dtype=out_dtype,
+        )
 
     # Triton implementation
     # if decode_qlen == 1:
@@ -936,9 +818,125 @@ def test_mla(
         cal_diff(out_ref, out_gluon, f"out_gluon_{name}", use_fp8=(name == "bh16bn128"))
         return err, us_decode
 
+    def test_absorb_decode_mi400():
+        # mi400 (gfx1250) fp8 MLA decode, dispatched as a decode backend peer of
+        # the bf16/fp8/gluon paths. It ignores the standard bf16 inputs/out_ref
+        # and builds its own fp8 + rope-split2 packed case, checked against
+        # _ref_mla_mi400. Dispatch key is (gqa_ratio, q_seq_len) ==
+        # (nhead, decode_qlen); unsupported combos and WIP variants are recorded
+        # as skipped (not failures) so the driver does not abort.
+        ret["mi400:nhead"] = nhead
+        ret["mi400:decode_qlen"] = decode_qlen
+        ret["mi400:batch"] = batch_size
+        ret["mi400:ctx"] = ctx_lens
+        ret["mi400:skipped"] = True
+        ret["mi400:passed"] = None
+        ret["mi400:finite"] = None
+        ret["mi400:cos_diff"] = None
+
+        variant = _MI400_VARIANT_BY_KEY.get((nhead, decode_qlen))
+        if variant is None:
+            ret["mi400:reason"] = "unsupported (gqa,qseq)"
+            aiter.logger.info(
+                "mla_decode-mi400 [gqa=%d q=%d]: skipped (unsupported dispatch combo)",
+                nhead,
+                decode_qlen,
+            )
+            return
+        if variant.wip:
+            ret["mi400:variant"] = variant.name
+            ret["mi400:reason"] = "WIP"
+            aiter.logger.info(
+                "mla_decode-mi400 [%s]: skipped (WIP, stage1 not yet reconciled "
+                "with poc_kl golden)",
+                variant.name,
+            )
+            return
+
+        ret["mi400:variant"] = variant.name
+        ret["mi400:skipped"] = False
+        # Looser than the generic fp8 3e-2 tolerance: with page shuffle + OOB +
+        # non-unit scales all on, short-KV / multi-batch combos (e.g. q4,
+        # batch=2, ctx=65) sit just above 3e-2 from fp8 quant noise.
+        cos_threshold = 5e-2
+        # mi400-specific coverage knobs are fixed fully-on (page shuffle + OOB
+        # padding + non-unit scales) for every supported combo.
+        case = _make_mla_mi400_case(
+            batch=batch_size,
+            kv_seq_len=ctx_lens,
+            gqa_ratio=nhead,
+            q_seq_len=decode_qlen,
+        )
+
+        # Single launch for functional/numerical validation. run_perftest would
+        # launch the kernel ~100x which, with the current temporary PyTorch
+        # stage2, can leave non-finite values in out.
+        attn_logits, attn_lse = aiter.mla.mla_decode_fwd(
+            case["q"],
+            case["kv_buffer"],
+            case["out"],
+            case["qo_indptr"],
+            case["kv_indptr"],
+            case["kv_indices"],
+            case["kv_last_page_lens"],
+            case["q_seq_len"],
+            case["page_size"],
+            case["nhead_kv"],
+            1.0 / (case["qk_head_dim"] ** 0.5),
+            num_kv_splits=case["num_kv_splits"],
+            num_kv_splits_indptr=case["num_kv_splits_indptr"],
+            q_scale=case["q_scale"],
+            kv_scale=case["kv_scale"],
+            return_lse=True,
+        )
+        out_check = case["out"].clone()
+
+        out_shape = (
+            case["batch"] * case["q_seq_len"],
+            case["nhead"],
+            case["v_head_dim"],
+        )
+        logits_shape = (
+            case["batch"] * case["q_seq_len"],
+            case["num_kv_splits"],
+            case["nhead"],
+            case["v_head_dim"],
+        )
+        # Structural shape checks are hard asserts: they must always hold.
+        assert out_check.shape == out_shape
+        assert attn_logits.shape == logits_shape
+        assert attn_lse.shape == (case["batch"] * case["q_seq_len"], case["nhead"])
+
+        finite = (
+            torch.isfinite(out_check.detach().float().cpu()).all().item()
+            and torch.isfinite(attn_logits.detach().float().cpu()).all().item()
+            and torch.isfinite(attn_lse.detach().float().cpu()).all().item()
+        )
+        if finite:
+            expected = _ref_mla_mi400(case)
+            cos_diff = _cosine_diff(out_check, expected)
+        else:
+            cos_diff = float("inf")
+
+        passed = finite and cos_diff < cos_threshold
+        ret["mi400:finite"] = finite
+        ret["mi400:cos_diff"] = cos_diff
+        ret["mi400:passed"] = passed
+        aiter.logger.info(
+            "mla_decode-mi400 [%s | batch=%d ctx=%d]: finite=%s cos_diff=%.3e %s",
+            variant.name,
+            batch_size,
+            ctx_lens,
+            finite,
+            cos_diff,
+            "passed" if passed else "FAILED",
+        )
+
     err = None
     us_asm_decode = 1e12
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
+    if mi400:
+        test_absorb_decode_mi400()
+    elif (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
         16,
         32,
         64,
@@ -948,20 +946,23 @@ def test_mla(
     elif kvtype == dtypes.fp8 and nhead in [8, 16, 128]:
         err, us_asm_decode = test_absorb_decode_fp8()
 
-    ret["decode:err"] = err
-    ret["decode:asm_576"] = us_asm_decode
+    # Standard decode perf/throughput bookkeeping; mi400 records its own
+    # mi400:* keys inside the sub-test and skips this block.
+    if not mi400:
+        ret["decode:err"] = err
+        ret["decode:asm_576"] = us_asm_decode
 
-    flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
-    bytes = (
-        total_kv * nhead_kv * qk_head_dim * (torch.finfo(kvtype).bits // 8)
-        + total_q * nhead * qk_head_dim * (torch.finfo(dtype).bits // 8)
-        + total_q * nhead * v_head_dim * (torch.finfo(out_dtype).bits // 8)
-    )
+        flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
+        bytes = (
+            total_kv * nhead_kv * qk_head_dim * (torch.finfo(kvtype).bits // 8)
+            + total_q * nhead * qk_head_dim * (torch.finfo(dtype).bits // 8)
+            + total_q * nhead * v_head_dim * (torch.finfo(out_dtype).bits // 8)
+        )
 
-    ret["decode:flops"] = flops
-    ret["decode:bytes"] = bytes
-    ret["decode:TFLOPS"] = flops / us_asm_decode / 1e6
-    ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
+        ret["decode:flops"] = flops
+        ret["decode:bytes"] = bytes
+        ret["decode:TFLOPS"] = flops / us_asm_decode / 1e6
+        ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
 
     # Gluon MLA decode test (bf16 only, nhead in (64,128), decode_qlen=1,
     # head_dim_ckv=512, head_dim_kpe=64, batch in (64,128,256), page_size=1).
