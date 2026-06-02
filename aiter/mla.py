@@ -226,6 +226,8 @@ def mla_decode_fwd(
         if nhead in [8, 16] and max_seqlen_q == 1:
             MAYBE_FINAL_OUT = False
 
+        _is_gfx1250 = get_gfx() == "gfx1250"
+
         logits = (
             o.view((total_s, num_kv_splits, nhead, v_head_dim))
             if (
@@ -238,6 +240,7 @@ def mla_decode_fwd(
                         and kv_buffer.dtype == dtypes.bf16
                         and nhead == 32
                     )
+                    or _is_gfx1250
                 )
             )
             else torch.empty(
@@ -279,6 +282,11 @@ def mla_decode_fwd(
             kv_scale,
         )
 
+        if _is_gfx1250 and num_kv_splits == 1:
+            if final_lse is not None:
+                final_lse.copy_(attn_lse[:, 0, :, 0])
+            return logits, final_lse if return_lse else None
+
         if num_kv_splits == 1 and (
             q.dtype == dtypes.fp8
             or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
@@ -302,6 +310,15 @@ def mla_decode_fwd(
             if has_final_lse
             else torch.empty((1,), dtype=dtypes.fp32, device=device)
         )
+        kv_indptr_stage2 = kv_indptr
+        if _is_gfx1250:
+            # gfx1250 stage1 consumes page-level kv_indptr, but stage2 needs
+            # token lengths to decide how many split partials are valid.
+            kv_page_counts = kv_indptr[1:] - kv_indptr[:-1]
+            kv_seq_lens = (kv_page_counts - 1) * page_size + kv_last_page_lens
+            kv_indptr_stage2 = torch.empty_like(kv_indptr)
+            kv_indptr_stage2[0] = 0
+            kv_indptr_stage2[1:] = torch.cumsum(kv_seq_lens, dim=0)
 
         _fwd_kernel_stage2_asm[grid](
             logits,
@@ -309,7 +326,7 @@ def mla_decode_fwd(
             o,
             final_lse_buf,
             qo_indptr,
-            kv_indptr,
+            kv_indptr_stage2,
             num_kv_splits_indptr,
             attn_lse.stride(0),
             attn_lse.stride(2),
