@@ -833,6 +833,9 @@ def test_mla(
         ret["mi400:passed"] = None
         ret["mi400:finite"] = None
         ret["mi400:cos_diff"] = None
+        ret["mi400:us"] = None
+        ret["mi400:TFLOPS"] = None
+        ret["mi400:TB/s"] = None
 
         variant = _MI400_VARIANT_BY_KEY.get((nhead, decode_qlen))
         if variant is None:
@@ -868,9 +871,9 @@ def test_mla(
             q_seq_len=decode_qlen,
         )
 
-        # Single launch for functional/numerical validation. run_perftest would
-        # launch the kernel ~100x which, with the current temporary PyTorch
-        # stage2, can leave non-finite values in out.
+        # Single launch for functional/numerical validation, kept separate from
+        # the perf loop below so the correctness check always inspects one clean
+        # launch into the freshly zeroed out buffer.
         attn_logits, attn_lse = aiter.mla.mla_decode_fwd(
             case["q"],
             case["kv_buffer"],
@@ -930,6 +933,56 @@ def test_mla(
             finite,
             cos_diff,
             "passed" if passed else "FAILED",
+        )
+
+        # Performance: zero-initialized split/out buffers make the repeated
+        # launches safe, so time the kernel over the standard perftest loop.
+        # Correctness was already validated above on the single launch.
+        _, us_mi400 = run_perftest(
+            aiter.mla.mla_decode_fwd,
+            case["q"],
+            case["kv_buffer"],
+            case["out"],
+            case["qo_indptr"],
+            case["kv_indptr"],
+            case["kv_indices"],
+            case["kv_last_page_lens"],
+            case["q_seq_len"],
+            case["page_size"],
+            case["nhead_kv"],
+            1.0 / (case["qk_head_dim"] ** 0.5),
+            num_kv_splits=case["num_kv_splits"],
+            num_kv_splits_indptr=case["num_kv_splits_indptr"],
+            q_scale=case["q_scale"],
+            kv_scale=case["kv_scale"],
+            return_lse=True,
+        )
+
+        total_q = case["batch"] * case["q_seq_len"]
+        total_kv = case["batch"] * case["kv_seq_len"]
+        mi_flops = (
+            case["q_seq_len"]
+            * total_kv
+            * case["nhead"]
+            * (case["qk_head_dim"] + case["v_head_dim"])
+            * 2
+        )
+        mi_bytes = (
+            total_kv * case["nhead_kv"] * case["qk_head_dim"] * (torch.finfo(dtypes.fp8).bits // 8)
+            + total_q * case["nhead"] * case["qk_head_dim"] * (torch.finfo(dtypes.fp8).bits // 8)
+            + total_q * case["nhead"] * case["v_head_dim"] * (torch.finfo(torch.bfloat16).bits // 8)
+        )
+        ret["mi400:us"] = us_mi400
+        ret["mi400:TFLOPS"] = mi_flops / us_mi400 / 1e6
+        ret["mi400:TB/s"] = mi_bytes / us_mi400 / 1e6
+        aiter.logger.info(
+            "mla_decode-mi400 [%s | batch=%d ctx=%d]: %8.2f us  %7.2f TFLOPS  %7.2f TB/s",
+            variant.name,
+            batch_size,
+            ctx_lens,
+            us_mi400,
+            ret["mi400:TFLOPS"],
+            ret["mi400:TB/s"],
         )
 
     err = None
