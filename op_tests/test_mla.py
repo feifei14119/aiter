@@ -183,9 +183,11 @@ _MI400_CTX_LENS = [65, 128, 257, 578]
 _MI400_BATCH_SIZES = [1, 2, 3]
 
 
-def _pack_rope_split2_pages(tensor, nope_dim, rope_dim):
+def _pack_rope_split2_q_pages(tensor, nope_dim, rope_dim):
     shape = tensor.shape
     assert shape[-1] == nope_dim + rope_dim
+    # [..., nhead, nope+rope] -> [..., nhead*nope] + [..., nhead*rope]
+    # -> [..., nhead, nope+rope], with nope/rope groups contiguous across heads.
     packed = torch.cat(
         (
             tensor[..., :nope_dim].reshape(*shape[:-2], shape[-2] * nope_dim),
@@ -260,13 +262,13 @@ def _make_mla_mi400_case(
     q_scale, kv_scale = _make_scales(batch, device, enabled=use_non_unit_scales)
 
     return {
-        "kv_last_page_lens": kv_last_page_lens,
         "page_size": page_size,
         "num_kv_splits": num_kv_splits,
+        "num_pages_per_batch": num_pages_per_batch,
+        "kv_last_page_lens": kv_last_page_lens,
         "num_kv_splits_indptr": num_kv_splits_indptr,
         "q_scale": q_scale,
         "kv_scale": kv_scale,
-        "num_pages_per_batch": num_pages_per_batch,
     }
 
 
@@ -309,15 +311,14 @@ def _make_mla_mi400_kv_case(
 
 
 def _make_mla_mi400_q_case(
-    *, q_bf16, batch, decode_qlen, nhead, qk_head_dim, v_head_dim
+    *, q_fp8, batch, decode_qlen, nhead, qk_head_dim, v_head_dim
 ):
-    q_ref = q_bf16.to(dtypes.fp8)
-    q = _pack_rope_split2_pages(
-        q_ref.view(batch, decode_qlen, nhead, qk_head_dim),
+    q = _pack_rope_split2_q_pages(
+        q_fp8.view(batch, decode_qlen, nhead, qk_head_dim),
         v_head_dim,
         qk_head_dim - v_head_dim,
     ).view(batch * decode_qlen, nhead, qk_head_dim)
-    return q, q_ref
+    return q
 
 
 def _ref_mla_mi400(
@@ -348,9 +349,7 @@ def _ref_mla_mi400(
         key = kv
         value = kv[..., :v_head_dim]
 
-        logits = torch.einsum("qhd,kmd->hqk", q, key) * (
-            1.0 / (qk_head_dim**0.5)
-        )
+        logits = torch.einsum("qhd,kmd->hqk", q, key) * (1.0 / (qk_head_dim**0.5))
         weights = torch.softmax(logits, dim=-1)
         outputs.append(torch.einsum("hqk,kmd->qhd", weights, value).to(torch.bfloat16))
     return torch.cat(outputs, dim=0)
@@ -866,8 +865,9 @@ def test_mla(
                 page_indices_oob=page_indices_oob,
             )
         )
-        q_mi400, q_ref_mi400 = _make_mla_mi400_q_case(
-            q_bf16=q,
+        q_fp8_mi400 = q.to(dtypes.fp8)
+        q_mi400 = _make_mla_mi400_q_case(
+            q_fp8=q_fp8_mi400,
             batch=batch_size,
             decode_qlen=decode_qlen,
             nhead=nhead,
@@ -936,7 +936,7 @@ def test_mla(
         if finite:
             expected = _ref_mla_mi400(
                 case,
-                q_ref_mi400,
+                q_fp8_mi400,
                 kv_buffer_ref_mi400,
                 kv_indices_mi400,
                 batch_size,
@@ -991,14 +991,8 @@ def test_mla(
         total_kv = batch_size * ctx_lens
         mi_flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
         mi_bytes = (
-            total_kv
-            * nhead_kv
-            * qk_head_dim
-            * (torch.finfo(dtypes.fp8).bits // 8)
-            + total_q
-            * nhead
-            * qk_head_dim
-            * (torch.finfo(dtypes.fp8).bits // 8)
+            total_kv * nhead_kv * qk_head_dim * (torch.finfo(dtypes.fp8).bits // 8)
+            + total_q * nhead * qk_head_dim * (torch.finfo(dtypes.fp8).bits // 8)
             + total_q * nhead * v_head_dim * (torch.finfo(torch.bfloat16).bits // 8)
         )
         ret["mi400:us"] = us_mi400
