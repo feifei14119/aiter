@@ -248,13 +248,6 @@ def _make_mla_mi400_case(
     v_head_dim = 512
     num_pages_per_batch = (kv_seq_len + page_size - 1) // page_size
 
-    # Zero-initialized (not torch.empty): the gfx1250 stage2 copies splitData
-    # into out, but a zeroed buffer keeps the finiteness check robust against any
-    # element the kernel/stage2 leaves untouched.
-    out = torch.zeros(
-        (batch * q_seq_len, nhead, v_head_dim), dtype=torch.bfloat16, device=device
-    )
-
     qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * q_seq_len
     kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * kv_seq_len
     last_page_len = kv_seq_len % page_size or page_size
@@ -267,7 +260,6 @@ def _make_mla_mi400_case(
     q_scale, kv_scale = _make_scales(batch, device, enabled=use_non_unit_scales)
 
     return {
-        "out": out,
         "qo_indptr": qo_indptr,
         "kv_indptr": kv_indptr,
         "kv_last_page_lens": kv_last_page_lens,
@@ -887,10 +879,18 @@ def test_mla(
         # Single launch for functional/numerical validation, kept separate from
         # the perf loop below so the correctness check always inspects one clean
         # launch into the freshly zeroed out buffer.
+        out_mi400 = torch.zeros(
+            (
+                case["batch"] * case["q_seq_len"],
+                case["nhead"],
+                case["v_head_dim"],
+            ),
+            dtype=torch.bfloat16,
+        )
         attn_logits, attn_lse = aiter.mla.mla_decode_fwd(
             q_mi400,
             kv_buffer_mi400,
-            case["out"],
+            out_mi400,
             case["qo_indptr"],
             case["kv_indptr"],
             kv_indices_mi400,
@@ -905,7 +905,7 @@ def test_mla(
             kv_scale=case["kv_scale"],
             return_lse=True,
         )
-        out_check = case["out"].clone()
+        out_check = out_mi400.clone()
 
         out_shape = (
             case["batch"] * case["q_seq_len"],
@@ -957,7 +957,7 @@ def test_mla(
             aiter.mla.mla_decode_fwd,
             q_mi400,
             kv_buffer_mi400,
-            case["out"],
+            out_mi400,
             case["qo_indptr"],
             case["kv_indptr"],
             kv_indices_mi400,
