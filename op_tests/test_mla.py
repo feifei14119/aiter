@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 
 import aiter
-import aiter.mla as mla
+import aiter.mla
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.attention import mla_decode_stage1_asm_fwd
@@ -297,9 +297,9 @@ def _make_mla_mi400_kv_case(
     total_page_indices = batch * (num_pages_per_batch + page_indices_oob)
     total_pages = batch * num_pages_per_batch
 
-    kv_buffer_logical_bf16 = kv_buffer_bf16.view(
-        -1, page_size, nhead_kv, qk_head_dim
-    )[:total_pages].contiguous()
+    kv_buffer_logical_bf16 = kv_buffer_bf16.view(-1, page_size, nhead_kv, qk_head_dim)[
+        :total_pages
+    ].contiguous()
     # The kernel consumes a compact block table, with OOB padding only after all
     # valid pages. KV pages are scattered into their physical page ids.
     shuffled_page_indices = _make_page_permutation(total_pages, shuffle=shuffle_pages)
