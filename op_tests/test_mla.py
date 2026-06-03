@@ -250,7 +250,6 @@ def _make_mla_mi400_case(
     num_kv_splits = 1
     num_pages_per_batch = (ctx_lens + page_size - 1) // page_size
 
-    kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * ctx_lens
     last_page_len = ctx_lens % page_size or page_size
     kv_last_page_lens = torch.full(
         (batch,), last_page_len, dtype=torch.int32, device=device
@@ -261,7 +260,6 @@ def _make_mla_mi400_case(
     q_scale, kv_scale = _make_scales(batch, device, enabled=use_non_unit_scales)
 
     return {
-        "kv_indptr": kv_indptr,
         "kv_last_page_lens": kv_last_page_lens,
         "page_size": page_size,
         "num_kv_splits": num_kv_splits,
@@ -899,7 +897,7 @@ def test_mla(
             kv_buffer_mi400,
             out_mi400,
             qo_indptr,
-            case["kv_indptr"],
+            kv_indptr,
             kv_indices_mi400,
             case["kv_last_page_lens"],
             decode_qlen,
@@ -975,7 +973,7 @@ def test_mla(
             kv_buffer_mi400,
             out_mi400,
             qo_indptr,
-            case["kv_indptr"],
+            kv_indptr,
             kv_indices_mi400,
             case["kv_last_page_lens"],
             decode_qlen,
@@ -1296,6 +1294,7 @@ if _run_mi400:
     args.block_size = 64
     args.kv_lora_rank = 512
     args.qk_rope_head_dim = 64
+    args.varlen = False
 
 mi400_failures = []
 for nhead, decode_qlen in args.nhead:
