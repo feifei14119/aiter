@@ -137,8 +137,8 @@ def torch_mla_extend(
 #
 # Merged into the standard test_mla driver: when --mi400 is active, the driver
 # overrides its sweep dims to the mi400 combos and test_mla() routes each
-# (nhead=Gqa, decode_qlen=qSeqLen, batch, ctx_len) combo through the mi400
-# fp8 decode check below. Unsupported (Gqa, qSeqLen) combos and WIP variants
+# (nhead=Gqa, decode_qlen, batch, ctx_len) combo through the mi400 fp8 decode
+# check below. Unsupported (Gqa, decode_qlen) combos and WIP variants
 # are skipped. Exercises the shader variants registered in
 # hsa/gfx1250/mla/mla_asm.csv. Active only when get_gfx() == "gfx1250".
 # ###########################################################################
@@ -148,7 +148,7 @@ def torch_mla_extend(
 class MlaMi400KernelVariant:
     name: str
     gqa_ratio: int
-    q_seq_len: int
+    decode_qlen: int
     # WIP variants are skipped. Their stage1 asm kernel has not yet been
     # reconciled against a stable golden, so
     # numerics are known-bad (qh16-q2: cos~1.0; qh64-q1: non-finite). Keep them
@@ -157,22 +157,34 @@ class MlaMi400KernelVariant:
 
 
 _MI400_KERNEL_VARIANTS = [
-    MlaMi400KernelVariant(name="qh16-q1-16mx1-32nx4-np-3p", gqa_ratio=16, q_seq_len=1),
     MlaMi400KernelVariant(
-        name="qh16-q2-16mx2-32nx4-np-3p", gqa_ratio=16, q_seq_len=2, wip=True
+        name="qh16-q1-16mx1-32nx4-np-3p", gqa_ratio=16, decode_qlen=1
     ),
-    MlaMi400KernelVariant(name="qh16-q4-16mx4-64nx1-np", gqa_ratio=16, q_seq_len=4),
     MlaMi400KernelVariant(
-        name="qh64-q1-16mx4-64nx1-np", gqa_ratio=64, q_seq_len=1, wip=True
+        name="qh16-q2-16mx2-32nx4-np-3p",
+        gqa_ratio=16,
+        decode_qlen=2,
+        wip=True,
+    ),
+    MlaMi400KernelVariant(
+        name="qh16-q4-16mx4-64nx1-np", gqa_ratio=16, decode_qlen=4
+    ),
+    MlaMi400KernelVariant(
+        name="qh64-q1-16mx4-64nx1-np",
+        gqa_ratio=64,
+        decode_qlen=1,
+        wip=True,
     ),
 ]
 
-# Dispatch key (gqa_ratio, q_seq_len) -> variant. Source of truth for which
+# Dispatch key (gqa_ratio, decode_qlen) -> variant. Source of truth for which
 # (nhead, decode_qlen) combos the mi400 decode check supports and which are WIP.
-_MI400_VARIANT_BY_KEY = {(v.gqa_ratio, v.q_seq_len): v for v in _MI400_KERNEL_VARIANTS}
+_MI400_VARIANT_BY_KEY = {
+    (v.gqa_ratio, v.decode_qlen): v for v in _MI400_KERNEL_VARIANTS
+}
 
 # mi400 driver sweep dims (applied as arg overrides when --mi400 is active).
-_MI400_NHEAD = [(v.gqa_ratio, v.q_seq_len) for v in _MI400_KERNEL_VARIANTS]
+_MI400_NHEAD = [(v.gqa_ratio, v.decode_qlen) for v in _MI400_KERNEL_VARIANTS]
 _MI400_CTX_LENS = [65, 128, 257, 578]
 _MI400_BATCH_SIZES = [1, 2, 3]
 
@@ -231,14 +243,16 @@ def _make_mla_mi400_case(
     batch,
     kv_seq_len,
     gqa_ratio,
-    q_seq_len,
+    decode_qlen,
     use_non_unit_scales=True,
 ):
     repo_hsa_dir = Path(__file__).resolve().parents[1] / "hsa"
     os.environ["AITER_ASM_DIR"] = str(repo_hsa_dir)
 
     device = torch.device("cuda")
-    torch.manual_seed(20260513 + batch * 1009 + kv_seq_len + gqa_ratio * 7 + q_seq_len)
+    torch.manual_seed(
+        20260513 + batch * 1009 + kv_seq_len + gqa_ratio * 7 + decode_qlen
+    )
 
     page_size = 64
     num_kv_splits = 1
@@ -248,7 +262,7 @@ def _make_mla_mi400_case(
     v_head_dim = 512
     num_pages_per_batch = (kv_seq_len + page_size - 1) // page_size
 
-    qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * q_seq_len
+    qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * decode_qlen
     kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * kv_seq_len
     last_page_len = kv_seq_len % page_size or page_size
     kv_last_page_lens = torch.full(
@@ -263,7 +277,6 @@ def _make_mla_mi400_case(
         "qo_indptr": qo_indptr,
         "kv_indptr": kv_indptr,
         "kv_last_page_lens": kv_last_page_lens,
-        "q_seq_len": q_seq_len,
         "kv_seq_len": kv_seq_len,
         "page_size": page_size,
         "nhead_kv": nhead_kv,
@@ -318,25 +331,25 @@ def _make_mla_mi400_kv_case(
     return kv_buffer, kv_buffer_ref, kv_indices
 
 
-def _make_mla_mi400_q_case(*, q_bf16, batch, q_seq_len, nhead):
+def _make_mla_mi400_q_case(*, q_bf16, batch, decode_qlen, nhead):
     qk_head_dim = 576
     v_head_dim = 512
     q_ref = q_bf16.to(dtypes.fp8)
     q = _pack_rope_split2_pages(
-        q_ref.view(batch, q_seq_len, nhead, qk_head_dim),
+        q_ref.view(batch, decode_qlen, nhead, qk_head_dim),
         v_head_dim,
         qk_head_dim - v_head_dim,
-    ).view(batch * q_seq_len, nhead, qk_head_dim)
+    ).view(batch * decode_qlen, nhead, qk_head_dim)
     return q, q_ref
 
 
-def _ref_mla_mi400(case, q_ref, kv_buffer_ref, kv_indices):
+def _ref_mla_mi400(case, q_ref, kv_buffer_ref, kv_indices, decode_qlen):
     outputs = []
     num_pages = case["num_pages_per_batch"]
     kv_source = kv_buffer_ref
     for b in range(case["batch"]):
-        q_start = b * case["q_seq_len"]
-        q_end = q_start + case["q_seq_len"]
+        q_start = b * decode_qlen
+        q_end = q_start + decode_qlen
         q = q_ref[q_start:q_end].float() * case["q_scale"][b]
         page_indices = kv_indices[b * num_pages : (b + 1) * num_pages].long()
         kv = (
@@ -813,9 +826,9 @@ def test_mla(
         # mi400 (gfx1250) fp8 MLA decode, dispatched as a decode backend peer of
         # the bf16/fp8/gluon paths. It derives fp8 + rope-split2 packed Q/KV
         # from the standard bf16 inputs and checks against _ref_mla_mi400.
-        # Dispatch key is (gqa_ratio, q_seq_len) ==
-        # (nhead, decode_qlen); unsupported combos and WIP variants are recorded
-        # as skipped (not failures) so the driver does not abort.
+        # Dispatch key is (gqa_ratio, decode_qlen); unsupported combos and WIP
+        # variants are recorded as skipped (not failures) so the driver does
+        # not abort.
         ret["mi400:nhead"] = nhead
         ret["mi400:decode_qlen"] = decode_qlen
         ret["mi400:batch"] = batch_size
@@ -830,9 +843,9 @@ def test_mla(
 
         variant = _MI400_VARIANT_BY_KEY.get((nhead, decode_qlen))
         if variant is None:
-            ret["mi400:reason"] = "unsupported (gqa,qseq)"
+            ret["mi400:reason"] = "unsupported (gqa,decode_qlen)"
             aiter.logger.info(
-                "mla_decode-mi400 [gqa=%d q=%d]: skipped (unsupported dispatch combo)",
+                "mla_decode-mi400 [gqa=%d decode_qlen=%d]: skipped (unsupported dispatch combo)",
                 nhead,
                 decode_qlen,
             )
@@ -866,14 +879,14 @@ def test_mla(
         q_mi400, q_ref_mi400 = _make_mla_mi400_q_case(
             q_bf16=q,
             batch=batch_size,
-            q_seq_len=decode_qlen,
+            decode_qlen=decode_qlen,
             nhead=nhead,
         )
         case = _make_mla_mi400_case(
             batch=batch_size,
             kv_seq_len=ctx_lens,
             gqa_ratio=nhead,
-            q_seq_len=decode_qlen,
+            decode_qlen=decode_qlen,
         )
 
         # Single launch for functional/numerical validation, kept separate from
@@ -881,7 +894,7 @@ def test_mla(
         # launch into the freshly zeroed out buffer.
         out_mi400 = torch.zeros(
             (
-                case["batch"] * case["q_seq_len"],
+                case["batch"] * decode_qlen,
                 case["nhead"],
                 case["v_head_dim"],
             ),
@@ -895,7 +908,7 @@ def test_mla(
             case["kv_indptr"],
             kv_indices_mi400,
             case["kv_last_page_lens"],
-            case["q_seq_len"],
+            decode_qlen,
             case["page_size"],
             case["nhead_kv"],
             1.0 / (case["qk_head_dim"] ** 0.5),
@@ -908,12 +921,12 @@ def test_mla(
         out_check = out_mi400.clone()
 
         out_shape = (
-            case["batch"] * case["q_seq_len"],
+            case["batch"] * decode_qlen,
             case["nhead"],
             case["v_head_dim"],
         )
         logits_shape = (
-            case["batch"] * case["q_seq_len"],
+            case["batch"] * decode_qlen,
             case["num_kv_splits"],
             case["nhead"],
             case["v_head_dim"],
@@ -921,7 +934,7 @@ def test_mla(
         # Structural shape checks are hard asserts: they must always hold.
         assert out_check.shape == out_shape
         assert attn_logits.shape == logits_shape
-        assert attn_lse.shape == (case["batch"] * case["q_seq_len"], case["nhead"])
+        assert attn_lse.shape == (case["batch"] * decode_qlen, case["nhead"])
 
         finite = (
             torch.isfinite(out_check.detach().float().cpu()).all().item()
@@ -930,7 +943,11 @@ def test_mla(
         )
         if finite:
             expected = _ref_mla_mi400(
-                case, q_ref_mi400, kv_buffer_ref_mi400, kv_indices_mi400
+                case,
+                q_ref_mi400,
+                kv_buffer_ref_mi400,
+                kv_indices_mi400,
+                decode_qlen,
             )
             cos_diff = _cosine_diff(out_check, expected)
         else:
@@ -962,7 +979,7 @@ def test_mla(
             case["kv_indptr"],
             kv_indices_mi400,
             case["kv_last_page_lens"],
-            case["q_seq_len"],
+            decode_qlen,
             case["page_size"],
             case["nhead_kv"],
             1.0 / (case["qk_head_dim"] ** 0.5),
@@ -973,10 +990,10 @@ def test_mla(
             return_lse=True,
         )
 
-        total_q = case["batch"] * case["q_seq_len"]
+        total_q = case["batch"] * decode_qlen
         total_kv = case["batch"] * case["kv_seq_len"]
         mi_flops = (
-            case["q_seq_len"]
+            decode_qlen
             * total_kv
             * case["nhead"]
             * (case["qk_head_dim"] + case["v_head_dim"])
@@ -1278,7 +1295,7 @@ _run_mi400 = args.mi400 == "on" or (args.mi400 == "auto" and _detect_gfx() == "g
 
 if _run_mi400:
     # mi400 reuses the standard driver + test_mla(mi400=True); override the
-    # sweep dims to the mi400 fp8 decode combos. nhead carries (gqa, q_seq_len);
+    # sweep dims to the mi400 fp8 decode combos. nhead carries (gqa, decode_qlen);
     # WIP / unsupported combos self-skip inside the mi400 check.
     args.dtype = [dtypes.fp8]
     args.kv_dtype = [dtypes.fp8]
