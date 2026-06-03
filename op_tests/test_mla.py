@@ -157,18 +157,14 @@ class MlaMi400KernelVariant:
 
 
 _MI400_KERNEL_VARIANTS = [
-    MlaMi400KernelVariant(
-        name="qh16-q1-16mx1-32nx4-np-3p", nhead=16, decode_qlen=1
-    ),
+    MlaMi400KernelVariant(name="qh16-q1-16mx1-32nx4-np-3p", nhead=16, decode_qlen=1),
     MlaMi400KernelVariant(
         name="qh16-q2-16mx2-32nx4-np-3p",
         nhead=16,
         decode_qlen=2,
         wip=True,
     ),
-    MlaMi400KernelVariant(
-        name="qh16-q4-16mx4-64nx1-np", nhead=16, decode_qlen=4
-    ),
+    MlaMi400KernelVariant(name="qh16-q4-16mx4-64nx1-np", nhead=16, decode_qlen=4),
     MlaMi400KernelVariant(
         name="qh64-q1-16mx4-64nx1-np",
         nhead=64,
@@ -179,9 +175,7 @@ _MI400_KERNEL_VARIANTS = [
 
 # Dispatch key (nhead, decode_qlen) -> variant. Source of truth for which
 # (nhead, decode_qlen) combos the mi400 decode check supports and which are WIP.
-_MI400_VARIANT_BY_KEY = {
-    (v.nhead, v.decode_qlen): v for v in _MI400_KERNEL_VARIANTS
-}
+_MI400_VARIANT_BY_KEY = {(v.nhead, v.decode_qlen): v for v in _MI400_KERNEL_VARIANTS}
 
 # mi400 driver sweep dims (applied as arg overrides when --mi400 is active).
 _MI400_NHEAD = [(v.nhead, v.decode_qlen) for v in _MI400_KERNEL_VARIANTS]
@@ -250,15 +244,12 @@ def _make_mla_mi400_case(
     os.environ["AITER_ASM_DIR"] = str(repo_hsa_dir)
 
     device = torch.device("cuda")
-    torch.manual_seed(
-        20260513 + batch * 1009 + ctx_lens + nhead * 7 + decode_qlen
-    )
+    torch.manual_seed(20260513 + batch * 1009 + ctx_lens + nhead * 7 + decode_qlen)
 
     page_size = 64
     num_kv_splits = 1
     nhead_kv = 1
     qk_head_dim = 576
-    v_head_dim = 512
     num_pages_per_batch = (ctx_lens + page_size - 1) // page_size
 
     qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * decode_qlen
@@ -279,7 +270,6 @@ def _make_mla_mi400_case(
         "page_size": page_size,
         "nhead_kv": nhead_kv,
         "qk_head_dim": qk_head_dim,
-        "v_head_dim": v_head_dim,
         "num_kv_splits": num_kv_splits,
         "num_kv_splits_indptr": num_kv_splits_indptr,
         "q_scale": q_scale,
@@ -339,7 +329,14 @@ def _make_mla_mi400_q_case(*, q_bf16, batch, decode_qlen, nhead):
 
 
 def _ref_mla_mi400(
-    case, q_ref, kv_buffer_ref, kv_indices, batch_size, ctx_lens, decode_qlen
+    case,
+    q_ref,
+    kv_buffer_ref,
+    kv_indices,
+    batch_size,
+    ctx_lens,
+    decode_qlen,
+    v_head_dim,
 ):
     outputs = []
     num_pages = case["num_pages_per_batch"]
@@ -355,7 +352,7 @@ def _ref_mla_mi400(
         kv = kv.reshape(-1, case["nhead_kv"], case["qk_head_dim"])
         kv = kv[:ctx_lens]
         key = kv
-        value = kv[..., : case["v_head_dim"]]
+        value = kv[..., :v_head_dim]
 
         logits = torch.einsum("qhd,kmd->hqk", q, key) * (
             1.0 / (case["qk_head_dim"] ** 0.5)
@@ -893,7 +890,7 @@ def test_mla(
             (
                 batch_size * decode_qlen,
                 nhead,
-                case["v_head_dim"],
+                v_head_dim,
             ),
             dtype=torch.bfloat16,
         )
@@ -920,13 +917,13 @@ def test_mla(
         out_shape = (
             batch_size * decode_qlen,
             nhead,
-            case["v_head_dim"],
+            v_head_dim,
         )
         logits_shape = (
             batch_size * decode_qlen,
             case["num_kv_splits"],
             nhead,
-            case["v_head_dim"],
+            v_head_dim,
         )
         # Structural shape checks are hard asserts: they must always hold.
         assert out_check.shape == out_shape
@@ -947,6 +944,7 @@ def test_mla(
                 batch_size,
                 ctx_lens,
                 decode_qlen,
+                v_head_dim,
             )
             cos_diff = _cosine_diff(out_check, expected)
         else:
@@ -992,11 +990,7 @@ def test_mla(
         total_q = batch_size * decode_qlen
         total_kv = batch_size * ctx_lens
         mi_flops = (
-            decode_qlen
-            * total_kv
-            * nhead
-            * (case["qk_head_dim"] + case["v_head_dim"])
-            * 2
+            decode_qlen * total_kv * nhead * (case["qk_head_dim"] + v_head_dim) * 2
         )
         mi_bytes = (
             total_kv
@@ -1007,10 +1001,7 @@ def test_mla(
             * nhead
             * case["qk_head_dim"]
             * (torch.finfo(dtypes.fp8).bits // 8)
-            + total_q
-            * nhead
-            * case["v_head_dim"]
-            * (torch.finfo(torch.bfloat16).bits // 8)
+            + total_q * nhead * v_head_dim * (torch.finfo(torch.bfloat16).bits // 8)
         )
         ret["mi400:us"] = us_mi400
         ret["mi400:TFLOPS"] = mi_flops / us_mi400 / 1e6
@@ -1303,6 +1294,8 @@ if _run_mi400:
     args.batchSize = _MI400_BATCH_SIZES
     args.split_per_batch = [1]
     args.block_size = 64
+    args.kv_lora_rank = 512
+    args.qk_rope_head_dim = 64
 
 mi400_failures = []
 for nhead, decode_qlen in args.nhead:
