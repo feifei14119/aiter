@@ -226,43 +226,35 @@ def mla_decode_fwd(
         if nhead in [8, 16] and max_seqlen_q == 1:
             MAYBE_FINAL_OUT = False
 
-        # gfx1250 (mi400) drives the asm kernel with out_16_nosplit==1, so the
-        # passes==1 fast-path writes the FINAL bf16 output straight into R. With
-        # num_kv_splits==1 that bf16 R has exactly the footprint of `o`, so we
-        # alias `o` as R (like gfx942/gfx950): the kernel fills `o` in place and
-        # we skip the standalone fp32 split buffer plus the stage2 cast/copy.
         _is_gfx1250 = get_gfx() == "gfx1250"
-        _can_alias_o_as_logits = (
-            num_kv_splits == 1
-            and (
-                _is_gfx1250
-                or q.dtype == dtypes.fp8
-                or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
-            )
-        )
 
-        # gfx1250 (mi400) stage1 asm kernel may not write every element of the
-        # LSE buffers (e.g. OOB page padding), and the downstream finiteness
-        # check inspects the full lse tensors. Zero-initialize on gfx1250 so
-        # uninitialized memory cannot surface as transient NaN/Inf; other archs
-        # keep torch.empty to avoid the memset cost. (The output R/logits is
-        # aliased to `o` and fully written by the out_16_nosplit fast-path.)
-        _alloc_split = torch.zeros if _is_gfx1250 else torch.empty
         logits = (
             o.view((total_s, num_kv_splits, nhead, v_head_dim))
-            if _can_alias_o_as_logits
-            else _alloc_split(
+            if (
+                num_kv_splits == 1
+                and (
+                    q.dtype == dtypes.fp8
+                    or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+                    or (
+                        q.dtype == dtypes.bf16
+                        and kv_buffer.dtype == dtypes.bf16
+                        and nhead == 32
+                    )
+                    or _is_gfx1250
+                )
+            )
+            else torch.empty(
                 (total_s, num_kv_splits, nhead, v_head_dim),
                 dtype=dtypes.fp32,
                 device=device,
             )
         )
 
-        attn_lse = _alloc_split(
+        attn_lse = torch.empty(
             (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
         )
         final_lse = (
-            _alloc_split((total_s, nhead), dtype=dtypes.fp32, device=device)
+            torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
             if return_lse
             else None
         )
@@ -303,14 +295,19 @@ def mla_decode_fwd(
         )
 
         if _is_gfx1250:
-            # `o` already holds the final bf16 output (R aliased `o` above), so
-            # no fp32->bf16 stage2 copy is needed. Only mirror the per-split LSE
-            # into final_lse for the num_kv_splits==1 reduction.
             if final_lse is not None and num_kv_splits == 1:
                 final_lse.copy_(attn_lse[:, 0, :, 0])
             return logits, final_lse if return_lse else None
 
-        if _can_alias_o_as_logits:
+        if num_kv_splits == 1 and (
+            q.dtype == dtypes.fp8
+            or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+            or (
+                q.dtype == dtypes.bf16
+                and kv_buffer.dtype == dtypes.bf16
+                and nhead == 32
+            )
+        ):
             lse = final_lse if return_lse else attn_lse
             return logits.view(total_s, nhead, v_head_dim), lse
 
