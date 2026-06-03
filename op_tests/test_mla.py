@@ -241,7 +241,7 @@ def _make_scales(batch, device, *, enabled):
 def _make_mla_mi400_case(
     *,
     batch,
-    kv_seq_len,
+    ctx_lens,
     nhead,
     decode_qlen,
     use_non_unit_scales=True,
@@ -251,7 +251,7 @@ def _make_mla_mi400_case(
 
     device = torch.device("cuda")
     torch.manual_seed(
-        20260513 + batch * 1009 + kv_seq_len + nhead * 7 + decode_qlen
+        20260513 + batch * 1009 + ctx_lens + nhead * 7 + decode_qlen
     )
 
     page_size = 64
@@ -259,11 +259,11 @@ def _make_mla_mi400_case(
     nhead_kv = 1
     qk_head_dim = 576
     v_head_dim = 512
-    num_pages_per_batch = (kv_seq_len + page_size - 1) // page_size
+    num_pages_per_batch = (ctx_lens + page_size - 1) // page_size
 
     qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * decode_qlen
-    kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * kv_seq_len
-    last_page_len = kv_seq_len % page_size or page_size
+    kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * ctx_lens
+    last_page_len = ctx_lens % page_size or page_size
     kv_last_page_lens = torch.full(
         (batch,), last_page_len, dtype=torch.int32, device=device
     )
@@ -276,7 +276,6 @@ def _make_mla_mi400_case(
         "qo_indptr": qo_indptr,
         "kv_indptr": kv_indptr,
         "kv_last_page_lens": kv_last_page_lens,
-        "kv_seq_len": kv_seq_len,
         "page_size": page_size,
         "nhead_kv": nhead_kv,
         "qk_head_dim": qk_head_dim,
@@ -293,7 +292,7 @@ def _make_mla_mi400_kv_case(
     *,
     kv_buffer_bf16,
     batch,
-    kv_seq_len,
+    ctx_lens,
     page_indices_oob,
     shuffle_pages=True,
 ):
@@ -302,7 +301,7 @@ def _make_mla_mi400_kv_case(
     nhead_kv = 1
     qk_head_dim = 576
     v_head_dim = 512
-    num_pages_per_batch = (kv_seq_len + page_size - 1) // page_size
+    num_pages_per_batch = (ctx_lens + page_size - 1) // page_size
     total_page_indices = batch * (num_pages_per_batch + page_indices_oob)
     total_pages = batch * num_pages_per_batch
 
@@ -339,7 +338,9 @@ def _make_mla_mi400_q_case(*, q_bf16, batch, decode_qlen, nhead):
     return q, q_ref
 
 
-def _ref_mla_mi400(case, q_ref, kv_buffer_ref, kv_indices, batch_size, decode_qlen):
+def _ref_mla_mi400(
+    case, q_ref, kv_buffer_ref, kv_indices, batch_size, ctx_lens, decode_qlen
+):
     outputs = []
     num_pages = case["num_pages_per_batch"]
     kv_source = kv_buffer_ref
@@ -352,7 +353,7 @@ def _ref_mla_mi400(case, q_ref, kv_buffer_ref, kv_indices, batch_size, decode_ql
             torch.index_select(kv_source.float(), 0, page_indices) * case["kv_scale"][b]
         )
         kv = kv.reshape(-1, case["nhead_kv"], case["qk_head_dim"])
-        kv = kv[: case["kv_seq_len"]]
+        kv = kv[:ctx_lens]
         key = kv
         value = kv[..., : case["v_head_dim"]]
 
@@ -868,7 +869,7 @@ def test_mla(
             _make_mla_mi400_kv_case(
                 kv_buffer_bf16=kv_buffer,
                 batch=batch_size,
-                kv_seq_len=ctx_lens,
+                ctx_lens=ctx_lens,
                 page_indices_oob=page_indices_oob,
             )
         )
@@ -880,7 +881,7 @@ def test_mla(
         )
         case = _make_mla_mi400_case(
             batch=batch_size,
-            kv_seq_len=ctx_lens,
+            ctx_lens=ctx_lens,
             nhead=nhead,
             decode_qlen=decode_qlen,
         )
@@ -944,6 +945,7 @@ def test_mla(
                 kv_buffer_ref_mi400,
                 kv_indices_mi400,
                 batch_size,
+                ctx_lens,
                 decode_qlen,
             )
             cos_diff = _cosine_diff(out_check, expected)
@@ -988,7 +990,7 @@ def test_mla(
         )
 
         total_q = batch_size * decode_qlen
-        total_kv = batch_size * case["kv_seq_len"]
+        total_kv = batch_size * ctx_lens
         mi_flops = (
             decode_qlen
             * total_kv
