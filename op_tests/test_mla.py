@@ -248,7 +248,6 @@ def _make_mla_mi400_case(
 
     page_size = 64
     num_kv_splits = 1
-    qk_head_dim = 576
     num_pages_per_batch = (ctx_lens + page_size - 1) // page_size
 
     qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * decode_qlen
@@ -267,7 +266,6 @@ def _make_mla_mi400_case(
         "kv_indptr": kv_indptr,
         "kv_last_page_lens": kv_last_page_lens,
         "page_size": page_size,
-        "qk_head_dim": qk_head_dim,
         "num_kv_splits": num_kv_splits,
         "num_kv_splits_indptr": num_kv_splits_indptr,
         "q_scale": q_scale,
@@ -281,14 +279,14 @@ def _make_mla_mi400_kv_case(
     kv_buffer_bf16,
     batch,
     ctx_lens,
+    qk_head_dim,
+    v_head_dim,
     page_indices_oob,
     shuffle_pages=True,
 ):
     device = torch.device("cuda")
     page_size = 64
     nhead_kv = 1
-    qk_head_dim = 576
-    v_head_dim = 512
     num_pages_per_batch = (ctx_lens + page_size - 1) // page_size
     total_page_indices = batch * (num_pages_per_batch + page_indices_oob)
     total_pages = batch * num_pages_per_batch
@@ -314,9 +312,9 @@ def _make_mla_mi400_kv_case(
     return kv_buffer, kv_buffer_ref, kv_indices
 
 
-def _make_mla_mi400_q_case(*, q_bf16, batch, decode_qlen, nhead):
-    qk_head_dim = 576
-    v_head_dim = 512
+def _make_mla_mi400_q_case(
+    *, q_bf16, batch, decode_qlen, nhead, qk_head_dim, v_head_dim
+):
     q_ref = q_bf16.to(dtypes.fp8)
     q = _pack_rope_split2_pages(
         q_ref.view(batch, decode_qlen, nhead, qk_head_dim),
@@ -335,6 +333,7 @@ def _ref_mla_mi400(
     ctx_lens,
     decode_qlen,
     nhead_kv,
+    qk_head_dim,
     v_head_dim,
 ):
     outputs = []
@@ -348,13 +347,13 @@ def _ref_mla_mi400(
         kv = (
             torch.index_select(kv_source.float(), 0, page_indices) * case["kv_scale"][b]
         )
-        kv = kv.reshape(-1, nhead_kv, case["qk_head_dim"])
+        kv = kv.reshape(-1, nhead_kv, qk_head_dim)
         kv = kv[:ctx_lens]
         key = kv
         value = kv[..., :v_head_dim]
 
         logits = torch.einsum("qhd,kmd->hqk", q, key) * (
-            1.0 / (case["qk_head_dim"] ** 0.5)
+            1.0 / (qk_head_dim**0.5)
         )
         weights = torch.softmax(logits, dim=-1)
         outputs.append(torch.einsum("hqk,kmd->qhd", weights, value).to(torch.bfloat16))
@@ -866,6 +865,8 @@ def test_mla(
                 kv_buffer_bf16=kv_buffer,
                 batch=batch_size,
                 ctx_lens=ctx_lens,
+                qk_head_dim=qk_head_dim,
+                v_head_dim=v_head_dim,
                 page_indices_oob=page_indices_oob,
             )
         )
@@ -874,6 +875,8 @@ def test_mla(
             batch=batch_size,
             decode_qlen=decode_qlen,
             nhead=nhead,
+            qk_head_dim=qk_head_dim,
+            v_head_dim=v_head_dim,
         )
         case = _make_mla_mi400_case(
             batch=batch_size,
@@ -904,7 +907,7 @@ def test_mla(
             decode_qlen,
             case["page_size"],
             nhead_kv,
-            1.0 / (case["qk_head_dim"] ** 0.5),
+            1.0 / (qk_head_dim**0.5),
             num_kv_splits=case["num_kv_splits"],
             num_kv_splits_indptr=case["num_kv_splits_indptr"],
             q_scale=case["q_scale"],
@@ -944,6 +947,7 @@ def test_mla(
                 ctx_lens,
                 decode_qlen,
                 nhead_kv,
+                qk_head_dim,
                 v_head_dim,
             )
             cos_diff = _cosine_diff(out_check, expected)
@@ -979,7 +983,7 @@ def test_mla(
             decode_qlen,
             case["page_size"],
             nhead_kv,
-            1.0 / (case["qk_head_dim"] ** 0.5),
+            1.0 / (qk_head_dim**0.5),
             num_kv_splits=case["num_kv_splits"],
             num_kv_splits_indptr=case["num_kv_splits_indptr"],
             q_scale=case["q_scale"],
@@ -989,17 +993,15 @@ def test_mla(
 
         total_q = batch_size * decode_qlen
         total_kv = batch_size * ctx_lens
-        mi_flops = (
-            decode_qlen * total_kv * nhead * (case["qk_head_dim"] + v_head_dim) * 2
-        )
+        mi_flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
         mi_bytes = (
             total_kv
             * nhead_kv
-            * case["qk_head_dim"]
+            * qk_head_dim
             * (torch.finfo(dtypes.fp8).bits // 8)
             + total_q
             * nhead
-            * case["qk_head_dim"]
+            * qk_head_dim
             * (torch.finfo(dtypes.fp8).bits // 8)
             + total_q * nhead * v_head_dim * (torch.finfo(torch.bfloat16).bits // 8)
         )
