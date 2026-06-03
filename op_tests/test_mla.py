@@ -250,7 +250,6 @@ def _make_mla_mi400_case(
     num_kv_splits = 1
     num_pages_per_batch = (ctx_lens + page_size - 1) // page_size
 
-    qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * decode_qlen
     kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * ctx_lens
     last_page_len = ctx_lens % page_size or page_size
     kv_last_page_lens = torch.full(
@@ -262,7 +261,6 @@ def _make_mla_mi400_case(
     q_scale, kv_scale = _make_scales(batch, device, enabled=use_non_unit_scales)
 
     return {
-        "qo_indptr": qo_indptr,
         "kv_indptr": kv_indptr,
         "kv_last_page_lens": kv_last_page_lens,
         "page_size": page_size,
@@ -900,7 +898,7 @@ def test_mla(
             q_mi400,
             kv_buffer_mi400,
             out_mi400,
-            case["qo_indptr"],
+            qo_indptr,
             case["kv_indptr"],
             kv_indices_mi400,
             case["kv_last_page_lens"],
@@ -976,7 +974,7 @@ def test_mla(
             q_mi400,
             kv_buffer_mi400,
             out_mi400,
-            case["qo_indptr"],
+            qo_indptr,
             case["kv_indptr"],
             kv_indices_mi400,
             case["kv_last_page_lens"],
