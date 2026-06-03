@@ -248,7 +248,6 @@ def _make_mla_mi400_case(
 
     page_size = 64
     num_kv_splits = 1
-    nhead_kv = 1
     qk_head_dim = 576
     num_pages_per_batch = (ctx_lens + page_size - 1) // page_size
 
@@ -268,7 +267,6 @@ def _make_mla_mi400_case(
         "kv_indptr": kv_indptr,
         "kv_last_page_lens": kv_last_page_lens,
         "page_size": page_size,
-        "nhead_kv": nhead_kv,
         "qk_head_dim": qk_head_dim,
         "num_kv_splits": num_kv_splits,
         "num_kv_splits_indptr": num_kv_splits_indptr,
@@ -336,6 +334,7 @@ def _ref_mla_mi400(
     batch_size,
     ctx_lens,
     decode_qlen,
+    nhead_kv,
     v_head_dim,
 ):
     outputs = []
@@ -349,7 +348,7 @@ def _ref_mla_mi400(
         kv = (
             torch.index_select(kv_source.float(), 0, page_indices) * case["kv_scale"][b]
         )
-        kv = kv.reshape(-1, case["nhead_kv"], case["qk_head_dim"])
+        kv = kv.reshape(-1, nhead_kv, case["qk_head_dim"])
         kv = kv[:ctx_lens]
         key = kv
         value = kv[..., :v_head_dim]
@@ -904,7 +903,7 @@ def test_mla(
             case["kv_last_page_lens"],
             decode_qlen,
             case["page_size"],
-            case["nhead_kv"],
+            nhead_kv,
             1.0 / (case["qk_head_dim"] ** 0.5),
             num_kv_splits=case["num_kv_splits"],
             num_kv_splits_indptr=case["num_kv_splits_indptr"],
@@ -944,6 +943,7 @@ def test_mla(
                 batch_size,
                 ctx_lens,
                 decode_qlen,
+                nhead_kv,
                 v_head_dim,
             )
             cos_diff = _cosine_diff(out_check, expected)
@@ -978,7 +978,7 @@ def test_mla(
             case["kv_last_page_lens"],
             decode_qlen,
             case["page_size"],
-            case["nhead_kv"],
+            nhead_kv,
             1.0 / (case["qk_head_dim"] ** 0.5),
             num_kv_splits=case["num_kv_splits"],
             num_kv_splits_indptr=case["num_kv_splits_indptr"],
@@ -994,7 +994,7 @@ def test_mla(
         )
         mi_bytes = (
             total_kv
-            * case["nhead_kv"]
+            * nhead_kv
             * case["qk_head_dim"]
             * (torch.finfo(dtypes.fp8).bits // 8)
             + total_q
