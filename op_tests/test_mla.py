@@ -150,7 +150,7 @@ class MlaMi400KernelVariant:
     gqa_ratio: int
     q_seq_len: int
     # WIP variants are skipped. Their stage1 asm kernel has not yet been
-    # reconciled against a poc_kl golden (no preset poc_kl test exists), so
+    # reconciled against a stable golden, so
     # numerics are known-bad (qh16-q2: cos~1.0; qh64-q1: non-finite). Keep them
     # listed for dispatch documentation; flip to False once stage1 is fixed.
     wip: bool = False
@@ -169,9 +169,7 @@ _MI400_KERNEL_VARIANTS = [
 
 # Dispatch key (gqa_ratio, q_seq_len) -> variant. Source of truth for which
 # (nhead, decode_qlen) combos the mi400 decode check supports and which are WIP.
-_MI400_VARIANT_BY_KEY = {
-    (v.gqa_ratio, v.q_seq_len): v for v in _MI400_KERNEL_VARIANTS
-}
+_MI400_VARIANT_BY_KEY = {(v.gqa_ratio, v.q_seq_len): v for v in _MI400_KERNEL_VARIANTS}
 
 # mi400 driver sweep dims (applied as arg overrides when --mi400 is active).
 _MI400_NHEAD = [(v.gqa_ratio, v.q_seq_len) for v in _MI400_KERNEL_VARIANTS]
@@ -234,9 +232,7 @@ def _make_mla_mi400_case(
     kv_seq_len,
     gqa_ratio,
     q_seq_len,
-    shuffle_pages=True,
     use_non_unit_scales=True,
-    page_indices_oob=4,
 ):
     repo_hsa_dir = Path(__file__).resolve().parents[1] / "hsa"
     os.environ["AITER_ASM_DIR"] = str(repo_hsa_dir)
@@ -251,40 +247,16 @@ def _make_mla_mi400_case(
     qk_head_dim = 576
     v_head_dim = 512
     num_pages_per_batch = (kv_seq_len + page_size - 1) // page_size
-    total_page_indices = batch * (num_pages_per_batch + page_indices_oob)
-    total_pages = batch * num_pages_per_batch
 
     q_bf16 = torch.randn(
         (batch * q_seq_len, nhead, qk_head_dim), dtype=torch.bfloat16, device=device
     )
-    kv_buffer_logical_bf16 = torch.randn(
-        (total_pages, page_size, nhead_kv, qk_head_dim),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    # Match poc_kl mla_shuffle() output for kl_mla_mtp0_np_3p_k128_test. The
-    # kernel consumes a compact block table, with OOB padding only after all
-    # valid pages. KV pages are scattered into their physical page ids.
-    shuffled_page_indices = _make_page_permutation(
-        total_pages, shuffle=shuffle_pages
-    )
-    kv_buffer_bf16 = torch.empty_like(kv_buffer_logical_bf16)
-    kv_indices = torch.zeros(total_page_indices, dtype=torch.int32, device=device)
-    for logical_page, physical_page in enumerate(shuffled_page_indices):
-        kv_buffer_bf16[physical_page] = kv_buffer_logical_bf16[logical_page]
-        kv_indices[logical_page] = physical_page
     q_ref = q_bf16.to(dtypes.fp8)
-    kv_buffer_ref = kv_buffer_bf16.to(dtypes.fp8)
     q = _pack_rope_split2_pages(
         q_ref.view(batch, q_seq_len, nhead, qk_head_dim),
         v_head_dim,
         qk_head_dim - v_head_dim,
     ).view(batch * q_seq_len, nhead, qk_head_dim)
-    kv_buffer = _pack_rope_split2_kv_pages(
-        kv_buffer_ref.view(total_pages, page_size, nhead_kv, qk_head_dim),
-        v_head_dim,
-        qk_head_dim - v_head_dim,
-    )
     # Zero-initialized (not torch.empty): the gfx1250 stage2 copies splitData
     # into out, but a zeroed buffer keeps the finiteness check robust against any
     # element the kernel/stage2 leaves untouched.
@@ -305,13 +277,10 @@ def _make_mla_mi400_case(
 
     return {
         "q": q,
-        "kv_buffer": kv_buffer,
         "q_ref": q_ref,
-        "kv_buffer_ref": kv_buffer_ref,
         "out": out,
         "qo_indptr": qo_indptr,
         "kv_indptr": kv_indptr,
-        "kv_indices": kv_indices,
         "kv_last_page_lens": kv_last_page_lens,
         "q_seq_len": q_seq_len,
         "kv_seq_len": kv_seq_len,
@@ -330,21 +299,57 @@ def _make_mla_mi400_case(
     }
 
 
-def _ref_mla_mi400(case):
+def _make_mla_mi400_kv_case(
+    *,
+    kv_buffer_bf16,
+    batch,
+    kv_seq_len,
+    page_indices_oob,
+    shuffle_pages=True,
+):
+    device = torch.device("cuda")
+    page_size = 64
+    nhead_kv = 1
+    qk_head_dim = 576
+    v_head_dim = 512
+    num_pages_per_batch = (kv_seq_len + page_size - 1) // page_size
+    total_page_indices = batch * (num_pages_per_batch + page_indices_oob)
+    total_pages = batch * num_pages_per_batch
+
+    kv_buffer_logical_bf16 = kv_buffer_bf16.view(
+        -1, page_size, nhead_kv, qk_head_dim
+    )[:total_pages].contiguous()
+    # The kernel consumes a compact block table, with OOB padding only after all
+    # valid pages. KV pages are scattered into their physical page ids.
+    shuffled_page_indices = _make_page_permutation(total_pages, shuffle=shuffle_pages)
+    kv_buffer_scattered_bf16 = torch.empty_like(kv_buffer_logical_bf16)
+    kv_indices = torch.zeros(total_page_indices, dtype=torch.int32, device=device)
+    for logical_page, physical_page in enumerate(shuffled_page_indices):
+        kv_buffer_scattered_bf16[physical_page] = kv_buffer_logical_bf16[logical_page]
+        kv_indices[logical_page] = physical_page
+
+    kv_buffer_ref = kv_buffer_scattered_bf16.to(dtypes.fp8)
+    kv_buffer = _pack_rope_split2_kv_pages(
+        kv_buffer_ref.view(total_pages, page_size, nhead_kv, qk_head_dim),
+        v_head_dim,
+        qk_head_dim - v_head_dim,
+    )
+    return kv_buffer, kv_buffer_ref, kv_indices
+
+
+def _ref_mla_mi400(case, kv_buffer_ref, kv_indices):
     outputs = []
     num_pages = case["num_pages_per_batch"]
     q_source = case["q_ref"] if case.get("q_ref") is not None else case["q"]
-    kv_source = (
-        case["kv_buffer_ref"]
-        if case.get("kv_buffer_ref") is not None
-        else case["kv_buffer"]
-    )
+    kv_source = kv_buffer_ref
     for b in range(case["batch"]):
         q_start = b * case["q_seq_len"]
         q_end = q_start + case["q_seq_len"]
         q = q_source[q_start:q_end].float() * case["q_scale"][b]
-        page_indices = case["kv_indices"][b * num_pages : (b + 1) * num_pages].long()
-        kv = torch.index_select(kv_source.float(), 0, page_indices) * case["kv_scale"][b]
+        page_indices = kv_indices[b * num_pages : (b + 1) * num_pages].long()
+        kv = (
+            torch.index_select(kv_source.float(), 0, page_indices) * case["kv_scale"][b]
+        )
         kv = kv.reshape(-1, case["nhead_kv"], case["qk_head_dim"])
         kv = kv[: case["kv_seq_len"]]
         key = kv
@@ -418,15 +423,9 @@ def test_mla(
     max_seqlen_kv = seq_lens_kv.max().item()
     total_qo = qo_indptr[-1].item()
     total_kv = kv_indptr[-1].item()
-    # mi400 builds its own fp8 + rope-split2 packed KV inside
-    # test_absorb_decode_mi400(); skip the large standard bf16 KV allocation.
-    kv_buffer = (
-        None
-        if mi400
-        else torch.randn(
-            (num_page * page_size, 1, kv_lora_rank + qk_rope_head_dim),
-            dtype=torch.bfloat16,
-        )
+    kv_buffer = torch.randn(
+        (num_page * page_size, 1, kv_lora_rank + qk_rope_head_dim),
+        dtype=torch.bfloat16,
     )
 
     # for none absorb (mha)
@@ -820,9 +819,9 @@ def test_mla(
 
     def test_absorb_decode_mi400():
         # mi400 (gfx1250) fp8 MLA decode, dispatched as a decode backend peer of
-        # the bf16/fp8/gluon paths. It ignores the standard bf16 inputs/out_ref
-        # and builds its own fp8 + rope-split2 packed case, checked against
-        # _ref_mla_mi400. Dispatch key is (gqa_ratio, q_seq_len) ==
+        # the bf16/fp8/gluon paths. It derives an fp8 + rope-split2 packed KV
+        # case from the standard bf16 kv_buffer and checks against _ref_mla_mi400.
+        # Dispatch key is (gqa_ratio, q_seq_len) ==
         # (nhead, decode_qlen); unsupported combos and WIP variants are recorded
         # as skipped (not failures) so the driver does not abort.
         ret["mi400:nhead"] = nhead
@@ -850,8 +849,7 @@ def test_mla(
             ret["mi400:variant"] = variant.name
             ret["mi400:reason"] = "WIP"
             aiter.logger.info(
-                "mla_decode-mi400 [%s]: skipped (WIP, stage1 not yet reconciled "
-                "with poc_kl golden)",
+                "mla_decode-mi400 [%s]: skipped (WIP stage1)",
                 variant.name,
             )
             return
@@ -864,6 +862,15 @@ def test_mla(
         cos_threshold = 5e-2
         # mi400-specific coverage knobs are fixed fully-on (page shuffle + OOB
         # padding + non-unit scales) for every supported combo.
+        page_indices_oob = 4
+        kv_buffer_mi400, kv_buffer_ref_mi400, kv_indices_mi400 = (
+            _make_mla_mi400_kv_case(
+                kv_buffer_bf16=kv_buffer,
+                batch=batch_size,
+                kv_seq_len=ctx_lens,
+                page_indices_oob=page_indices_oob,
+            )
+        )
         case = _make_mla_mi400_case(
             batch=batch_size,
             kv_seq_len=ctx_lens,
@@ -876,11 +883,11 @@ def test_mla(
         # launch into the freshly zeroed out buffer.
         attn_logits, attn_lse = aiter.mla.mla_decode_fwd(
             case["q"],
-            case["kv_buffer"],
+            kv_buffer_mi400,
             case["out"],
             case["qo_indptr"],
             case["kv_indptr"],
-            case["kv_indices"],
+            kv_indices_mi400,
             case["kv_last_page_lens"],
             case["q_seq_len"],
             case["page_size"],
@@ -916,7 +923,7 @@ def test_mla(
             and torch.isfinite(attn_lse.detach().float().cpu()).all().item()
         )
         if finite:
-            expected = _ref_mla_mi400(case)
+            expected = _ref_mla_mi400(case, kv_buffer_ref_mi400, kv_indices_mi400)
             cos_diff = _cosine_diff(out_check, expected)
         else:
             cos_diff = float("inf")
@@ -941,11 +948,11 @@ def test_mla(
         _, us_mi400 = run_perftest(
             aiter.mla.mla_decode_fwd,
             case["q"],
-            case["kv_buffer"],
+            kv_buffer_mi400,
             case["out"],
             case["qo_indptr"],
             case["kv_indptr"],
-            case["kv_indices"],
+            kv_indices_mi400,
             case["kv_last_page_lens"],
             case["q_seq_len"],
             case["page_size"],
@@ -968,9 +975,18 @@ def test_mla(
             * 2
         )
         mi_bytes = (
-            total_kv * case["nhead_kv"] * case["qk_head_dim"] * (torch.finfo(dtypes.fp8).bits // 8)
-            + total_q * case["nhead"] * case["qk_head_dim"] * (torch.finfo(dtypes.fp8).bits // 8)
-            + total_q * case["nhead"] * case["v_head_dim"] * (torch.finfo(torch.bfloat16).bits // 8)
+            total_kv
+            * case["nhead_kv"]
+            * case["qk_head_dim"]
+            * (torch.finfo(dtypes.fp8).bits // 8)
+            + total_q
+            * case["nhead"]
+            * case["qk_head_dim"]
+            * (torch.finfo(dtypes.fp8).bits // 8)
+            + total_q
+            * case["nhead"]
+            * case["v_head_dim"]
+            * (torch.finfo(torch.bfloat16).bits // 8)
         )
         ret["mi400:us"] = us_mi400
         ret["mi400:TFLOPS"] = mi_flops / us_mi400 / 1e6
@@ -1295,7 +1311,12 @@ for nhead, decode_qlen in args.nhead:
                 and not ret.get("mi400:passed", False)
             ):
                 mi400_failures.append(
-                    (ret.get("mi400:variant"), batch_size, ctx_len, ret.get("mi400:cos_diff"))
+                    (
+                        ret.get("mi400:variant"),
+                        batch_size,
+                        ctx_len,
+                        ret.get("mi400:cos_diff"),
+                    )
                 )
     df = pd.DataFrame(df)
     # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
