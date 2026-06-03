@@ -259,6 +259,15 @@ def _make_mla_mi400_case(
     num_kv_splits_indptr = (
         torch.arange(batch + 1, dtype=torch.int32, device=device) * num_kv_splits
     )
+    # gfx1250/mi400 stage1 asm kernel consumes a PAGE-level kv_indptr directly
+    # (it walks the page-level kv_indices block table). Build it here as the
+    # per-batch prefix sum of page counts so mla.py no longer needs to convert a
+    # token-level kv_indptr. With uniform ctx_lens this is [0, npb, 2*npb, ...].
+    kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=device)
+    kv_indptr[1:] = torch.cumsum(
+        torch.full((batch,), num_pages_per_batch, dtype=torch.int32, device=device),
+        dim=0,
+    )
     q_scale, kv_scale = _make_scales(batch, device, enabled=use_non_unit_scales)
 
     return {
@@ -266,6 +275,7 @@ def _make_mla_mi400_case(
         "num_kv_splits": num_kv_splits,
         "num_pages_per_batch": num_pages_per_batch,
         "kv_last_page_lens": kv_last_page_lens,
+        "kv_indptr": kv_indptr,
         "num_kv_splits_indptr": num_kv_splits_indptr,
         "q_scale": q_scale,
         "kv_scale": kv_scale,
@@ -925,7 +935,7 @@ def test_mla(
             kv_buffer_mi400,
             out_mi400,
             qo_indptr,
-            kv_indptr,
+            case["kv_indptr"],
             kv_indices_mi400,
             case["kv_last_page_lens"],
             decode_qlen,
@@ -1001,7 +1011,7 @@ def test_mla(
             kv_buffer_mi400,
             out_mi400,
             qo_indptr,
-            kv_indptr,
+            case["kv_indptr"],
             kv_indices_mi400,
             case["kv_last_page_lens"],
             decode_qlen,

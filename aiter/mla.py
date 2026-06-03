@@ -259,23 +259,11 @@ def mla_decode_fwd(
             else None
         )
 
-        kv_indptr_stage1 = kv_indptr
-        if _is_gfx1250:
-            kv_seq_lens = kv_indptr[1:] - kv_indptr[:-1]
-            kv_page_counts = torch.div(
-                kv_seq_lens + page_size - 1,
-                page_size,
-                rounding_mode="floor",
-            )
-            kv_indptr_stage1 = torch.empty_like(kv_indptr)
-            kv_indptr_stage1[0] = 0
-            kv_indptr_stage1[1:] = torch.cumsum(kv_page_counts, dim=0)
-
         aiter.mla_decode_stage1_asm_fwd(
             q,
             kv_buffer,
             qo_indptr,
-            kv_indptr_stage1,
+            kv_indptr,
             kv_indices,
             kv_last_page_lens,
             num_kv_splits_indptr,
