@@ -309,14 +309,16 @@ static void mla_decode_mi400_dispatch(
                     static_cast<int64_t>(kv_scale->numel()) >= batch,
                 __func__,
                 ": q_scale and kv_scale must have at least batch elements");
-    // ABI contract with the mi400 .co: kernel writes R (split partial output)
-    // as fp32 and LSE as fp32. Earlier versions of mla.py shared splitData with
-    // a bf16 `o` view when num_kv_splits==1, which silently made R only half
-    // the required size and produced GPU page faults. Reject that here so the
-    // upstream caller is forced to allocate a real fp32 R buffer.
-    AITER_CHECK(splitData->dtype() == AITER_DTYPE_fp32,
+    // ABI contract with the mi400 .co: with out_16_nosplit==1 (set below) the
+    // passes==1 fast-path writes the FINAL output directly into R as bf16 (no
+    // fp32 split partials, no stage2 reduction), so R must be a bf16 buffer
+    // sized exactly like the [total_s, nhead, v_head_dim] output. The upstream
+    // caller therefore aliases the bf16 `o` view as R when num_kv_splits==1.
+    // LSE is still emitted as fp32.
+    AITER_CHECK(splitData->dtype() == AITER_DTYPE_bf16,
                 __func__,
-                ": gfx1250 mi400 MLA requires splitData (R) to be fp32; got ",
+                ": gfx1250 mi400 MLA requires splitData (R) to be bf16 for the "
+                "out_16_nosplit fast-path; got ",
                 AiterDtype_to_str(splitData->dtype()));
     AITER_CHECK(splitLse->dtype() == AITER_DTYPE_fp32,
                 __func__,
@@ -371,7 +373,12 @@ static void mla_decode_mi400_dispatch(
     args.log2_page          = static_cast<unsigned int>(log2f(static_cast<float>(page_size)));
     args.ptr_QTP            = qo_indptr->data_ptr();
     args.ptr_STP            = num_kv_splits_indptr->data_ptr();
-    args.out_16_nosplit     = 0;
+    // out_16_nosplit==1 enables the passes==1 BF16 fast-path: the kernel writes
+    // the final attention output directly into R (ptr_R) as bf16 instead of
+    // emitting fp32 split partials that require a separate stage2 reduction.
+    // This lets mla.py alias the bf16 `o` buffer as R and skip the fp32 buffer
+    // plus the fp32->bf16 conversion. Only valid because we require kv_split==1.
+    args.out_16_nosplit     = 1;
     args.ptr_QROPE          = q_scale->data_ptr();
     args.ptr_KVROPE         = kv_scale->data_ptr();
 
