@@ -288,7 +288,6 @@ def _make_mla_mi400_case(
         "num_kv_splits_indptr": num_kv_splits_indptr,
         "q_scale": q_scale,
         "kv_scale": kv_scale,
-        "batch": batch,
         "num_pages_per_batch": num_pages_per_batch,
     }
 
@@ -343,11 +342,11 @@ def _make_mla_mi400_q_case(*, q_bf16, batch, decode_qlen, nhead):
     return q, q_ref
 
 
-def _ref_mla_mi400(case, q_ref, kv_buffer_ref, kv_indices, decode_qlen):
+def _ref_mla_mi400(case, q_ref, kv_buffer_ref, kv_indices, batch_size, decode_qlen):
     outputs = []
     num_pages = case["num_pages_per_batch"]
     kv_source = kv_buffer_ref
-    for b in range(case["batch"]):
+    for b in range(batch_size):
         q_start = b * decode_qlen
         q_end = q_start + decode_qlen
         q = q_ref[q_start:q_end].float() * case["q_scale"][b]
@@ -894,7 +893,7 @@ def test_mla(
         # launch into the freshly zeroed out buffer.
         out_mi400 = torch.zeros(
             (
-                case["batch"] * decode_qlen,
+                batch_size * decode_qlen,
                 case["nhead"],
                 case["v_head_dim"],
             ),
@@ -921,12 +920,12 @@ def test_mla(
         out_check = out_mi400.clone()
 
         out_shape = (
-            case["batch"] * decode_qlen,
+            batch_size * decode_qlen,
             case["nhead"],
             case["v_head_dim"],
         )
         logits_shape = (
-            case["batch"] * decode_qlen,
+            batch_size * decode_qlen,
             case["num_kv_splits"],
             case["nhead"],
             case["v_head_dim"],
@@ -934,7 +933,7 @@ def test_mla(
         # Structural shape checks are hard asserts: they must always hold.
         assert out_check.shape == out_shape
         assert attn_logits.shape == logits_shape
-        assert attn_lse.shape == (case["batch"] * decode_qlen, case["nhead"])
+        assert attn_lse.shape == (batch_size * decode_qlen, case["nhead"])
 
         finite = (
             torch.isfinite(out_check.detach().float().cpu()).all().item()
@@ -947,6 +946,7 @@ def test_mla(
                 q_ref_mi400,
                 kv_buffer_ref_mi400,
                 kv_indices_mi400,
+                batch_size,
                 decode_qlen,
             )
             cos_diff = _cosine_diff(out_check, expected)
@@ -990,8 +990,8 @@ def test_mla(
             return_lse=True,
         )
 
-        total_q = case["batch"] * decode_qlen
-        total_kv = case["batch"] * case["kv_seq_len"]
+        total_q = batch_size * decode_qlen
+        total_kv = batch_size * case["kv_seq_len"]
         mi_flops = (
             decode_qlen
             * total_kv
