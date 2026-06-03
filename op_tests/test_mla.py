@@ -248,15 +248,6 @@ def _make_mla_mi400_case(
     v_head_dim = 512
     num_pages_per_batch = (kv_seq_len + page_size - 1) // page_size
 
-    q_bf16 = torch.randn(
-        (batch * q_seq_len, nhead, qk_head_dim), dtype=torch.bfloat16, device=device
-    )
-    q_ref = q_bf16.to(dtypes.fp8)
-    q = _pack_rope_split2_pages(
-        q_ref.view(batch, q_seq_len, nhead, qk_head_dim),
-        v_head_dim,
-        qk_head_dim - v_head_dim,
-    ).view(batch * q_seq_len, nhead, qk_head_dim)
     # Zero-initialized (not torch.empty): the gfx1250 stage2 copies splitData
     # into out, but a zeroed buffer keeps the finiteness check robust against any
     # element the kernel/stage2 leaves untouched.
@@ -276,8 +267,6 @@ def _make_mla_mi400_case(
     q_scale, kv_scale = _make_scales(batch, device, enabled=use_non_unit_scales)
 
     return {
-        "q": q,
-        "q_ref": q_ref,
         "out": out,
         "qo_indptr": qo_indptr,
         "kv_indptr": kv_indptr,
@@ -337,15 +326,26 @@ def _make_mla_mi400_kv_case(
     return kv_buffer, kv_buffer_ref, kv_indices
 
 
-def _ref_mla_mi400(case, kv_buffer_ref, kv_indices):
+def _make_mla_mi400_q_case(*, q_bf16, batch, q_seq_len, nhead):
+    qk_head_dim = 576
+    v_head_dim = 512
+    q_ref = q_bf16.to(dtypes.fp8)
+    q = _pack_rope_split2_pages(
+        q_ref.view(batch, q_seq_len, nhead, qk_head_dim),
+        v_head_dim,
+        qk_head_dim - v_head_dim,
+    ).view(batch * q_seq_len, nhead, qk_head_dim)
+    return q, q_ref
+
+
+def _ref_mla_mi400(case, q_ref, kv_buffer_ref, kv_indices):
     outputs = []
     num_pages = case["num_pages_per_batch"]
-    q_source = case["q_ref"] if case.get("q_ref") is not None else case["q"]
     kv_source = kv_buffer_ref
     for b in range(case["batch"]):
         q_start = b * case["q_seq_len"]
         q_end = q_start + case["q_seq_len"]
-        q = q_source[q_start:q_end].float() * case["q_scale"][b]
+        q = q_ref[q_start:q_end].float() * case["q_scale"][b]
         page_indices = kv_indices[b * num_pages : (b + 1) * num_pages].long()
         kv = (
             torch.index_select(kv_source.float(), 0, page_indices) * case["kv_scale"][b]
@@ -819,8 +819,8 @@ def test_mla(
 
     def test_absorb_decode_mi400():
         # mi400 (gfx1250) fp8 MLA decode, dispatched as a decode backend peer of
-        # the bf16/fp8/gluon paths. It derives an fp8 + rope-split2 packed KV
-        # case from the standard bf16 kv_buffer and checks against _ref_mla_mi400.
+        # the bf16/fp8/gluon paths. It derives fp8 + rope-split2 packed Q/KV
+        # from the standard bf16 inputs and checks against _ref_mla_mi400.
         # Dispatch key is (gqa_ratio, q_seq_len) ==
         # (nhead, decode_qlen); unsupported combos and WIP variants are recorded
         # as skipped (not failures) so the driver does not abort.
@@ -871,6 +871,12 @@ def test_mla(
                 page_indices_oob=page_indices_oob,
             )
         )
+        q_mi400, q_ref_mi400 = _make_mla_mi400_q_case(
+            q_bf16=q,
+            batch=batch_size,
+            q_seq_len=decode_qlen,
+            nhead=nhead,
+        )
         case = _make_mla_mi400_case(
             batch=batch_size,
             kv_seq_len=ctx_lens,
@@ -882,7 +888,7 @@ def test_mla(
         # the perf loop below so the correctness check always inspects one clean
         # launch into the freshly zeroed out buffer.
         attn_logits, attn_lse = aiter.mla.mla_decode_fwd(
-            case["q"],
+            q_mi400,
             kv_buffer_mi400,
             case["out"],
             case["qo_indptr"],
@@ -923,7 +929,9 @@ def test_mla(
             and torch.isfinite(attn_lse.detach().float().cpu()).all().item()
         )
         if finite:
-            expected = _ref_mla_mi400(case, kv_buffer_ref_mi400, kv_indices_mi400)
+            expected = _ref_mla_mi400(
+                case, q_ref_mi400, kv_buffer_ref_mi400, kv_indices_mi400
+            )
             cos_diff = _cosine_diff(out_check, expected)
         else:
             cos_diff = float("inf")
@@ -947,7 +955,7 @@ def test_mla(
         # Correctness was already validated above on the single launch.
         _, us_mi400 = run_perftest(
             aiter.mla.mla_decode_fwd,
-            case["q"],
+            q_mi400,
             kv_buffer_mi400,
             case["out"],
             case["qo_indptr"],
