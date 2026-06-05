@@ -181,6 +181,7 @@ _MI400_VARIANT_BY_KEY = {(v.nhead, v.decode_qlen): v for v in _MI400_KERNEL_VARI
 _MI400_NHEAD = [(v.nhead, v.decode_qlen) for v in _MI400_KERNEL_VARIANTS]
 _MI400_CTX_LENS = [65, 128, 257, 578]
 _MI400_BATCH_SIZES = [1, 2, 3]
+_MI400_SPLIT_PER_BATCH = [1, 2]
 
 
 def _pack_rope_split2_q_pages(tensor, nope_dim, rope_dim):
@@ -240,16 +241,24 @@ def _make_mla_mi400_case(
     ctx_lens,
     nhead,
     decode_qlen,
+    num_kv_splits,
     use_non_unit_scales=True,
 ):
     repo_hsa_dir = Path(__file__).resolve().parents[1] / "hsa"
     os.environ["AITER_ASM_DIR"] = str(repo_hsa_dir)
 
     device = torch.device("cuda")
-    torch.manual_seed(20260513 + batch * 1009 + ctx_lens + nhead * 7 + decode_qlen)
+    assert num_kv_splits > 0
+    torch.manual_seed(
+        20260513
+        + batch * 1009
+        + ctx_lens
+        + nhead * 7
+        + decode_qlen
+        + num_kv_splits * 101
+    )
 
     page_size = 64
-    num_kv_splits = 1
     num_pages_per_batch = (ctx_lens + page_size - 1) // page_size
 
     last_page_len = ctx_lens % page_size or page_size
@@ -864,6 +873,7 @@ def test_mla(
         ret["mi400:decode_qlen"] = decode_qlen
         ret["mi400:batch"] = batch_size
         ret["mi400:ctx"] = ctx_lens
+        ret["mi400:num_kv_splits"] = split_per_batch
         ret["mi400:skipped"] = True
         ret["mi400:passed"] = None
         ret["mi400:finite"] = None
@@ -923,6 +933,7 @@ def test_mla(
             ctx_lens=ctx_lens,
             nhead=nhead,
             decode_qlen=decode_qlen,
+            num_kv_splits=split_per_batch,
         )
 
         # Single launch for functional/numerical validation, kept separate from
@@ -999,10 +1010,11 @@ def test_mla(
         ret["mi400:cos_diff"] = cos_diff
         ret["mi400:passed"] = passed
         aiter.logger.info(
-            "mla_decode-mi400 [%s | batch=%d ctx=%d]: finite=%s cos_diff=%.3e %s",
+            "mla_decode-mi400 [%s | batch=%d ctx=%d splits=%d]: finite=%s cos_diff=%.3e %s",
             variant.name,
             batch_size,
             ctx_lens,
+            case["num_kv_splits"],
             finite,
             cos_diff,
             "passed" if passed else "FAILED",
@@ -1349,7 +1361,7 @@ if _run_mi400:
     args.nhead = _MI400_NHEAD
     args.ctxLen = _MI400_CTX_LENS
     args.batchSize = _MI400_BATCH_SIZES
-    args.split_per_batch = [1]
+    args.split_per_batch = _MI400_SPLIT_PER_BATCH
     args.block_size = 64
     args.kv_lora_rank = 512
     args.qk_rope_head_dim = 64
