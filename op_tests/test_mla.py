@@ -194,8 +194,8 @@ _MI400_SPLIT_PER_BATCH = [1, 2]
 _POC_KL_CASES = [
     (16, 1, 2, 578, 1),  # test_kl_mla_a8w8_qh16_1tg_16mx1_32nx4_np_3p_test
     (16, 2, 2, 578, 1),  # test_kl_mla_a8w8_qh16_1tg_16mx2_32nx4_np_3p_test
-    (16, 4, 2, 578, 2),  # test_kl_mla_a8w8_qh16_1tg_16mx4_64nx1_np_test
     (64, 1, 4, 962, 2),  # test_kl_mla_a8w8_qh64_1tg_16mx4_64nx1_np_test
+    (16, 4, 2, 578, 2),  # test_kl_mla_a8w8_qh16_1tg_16mx4_64nx1_np_test
 ]
 # Distinct (nhead, decode_qlen) variant keys present in _POC_KL_CASES, order
 # preserved. Used as args.nhead grouping when --poc_kl on.
