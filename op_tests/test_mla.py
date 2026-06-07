@@ -162,14 +162,12 @@ _MI400_KERNEL_VARIANTS = [
         name="qh16-q2-16mx2-32nx4-np-3p",
         nhead=16,
         decode_qlen=2,
-        wip=True,
     ),
     MlaMi400KernelVariant(name="qh16-q4-16mx4-64nx1-np", nhead=16, decode_qlen=4),
     MlaMi400KernelVariant(
         name="qh64-q1-16mx4-64nx1-np",
         nhead=64,
         decode_qlen=1,
-        wip=True,
     ),
 ]
 
@@ -182,6 +180,30 @@ _MI400_NHEAD = [(v.nhead, v.decode_qlen) for v in _MI400_KERNEL_VARIANTS]
 _MI400_CTX_LENS = [65, 128, 257, 578]
 _MI400_BATCH_SIZES = [1, 2, 3]
 _MI400_SPLIT_PER_BATCH = [1, 2]
+
+# Exact poc_kl parity sweep: when --poc_kl on, the mi400 driver tests ONLY the
+# cases defined in poc_kl/mi400/mla/run.sh (one tuple per run.sh test), instead
+# of the cartesian sweep above. Each tuple is the aiter equivalent of a run.sh
+# `test_kl_mla_*` case:
+#   (nhead, decode_qlen, batch, ctx_lens, split_per_batch)
+# Mapping from run.sh args: gqa_ratio->nhead, kernel 16mx{N}->decode_qlen,
+# batch->batch, kv_seq_lens->ctx_lens, passes->split_per_batch.
+# WIP variants (qh16-q2, qh64-q1) are force-run in this mode since run.sh runs
+# all four. block_size=64 / fp8 / rope-split2 are already fixed in the mi400
+# path, matching run.sh's block_size=64 data_type=2 rope_split=2.
+_POC_KL_CASES = [
+    (16, 1, 2, 578, 1),  # test_kl_mla_a8w8_qh16_1tg_16mx1_32nx4_np_3p_test
+    (16, 2, 2, 578, 1),  # test_kl_mla_a8w8_qh16_1tg_16mx2_32nx4_np_3p_test
+    (16, 4, 2, 578, 2),  # test_kl_mla_a8w8_qh16_1tg_16mx4_64nx1_np_test
+    (64, 1, 4, 962, 2),  # test_kl_mla_a8w8_qh64_1tg_16mx4_64nx1_np_test
+]
+# Distinct (nhead, decode_qlen) variant keys present in _POC_KL_CASES, order
+# preserved. Used as args.nhead grouping when --poc_kl on.
+_POC_KL_NHEAD = list(dict.fromkeys((n, dq) for (n, dq, _b, _c, _s) in _POC_KL_CASES))
+
+# Set True at runtime when --poc_kl on; consulted by the mi400 check to force-run
+# WIP variants so the sweep matches run.sh exactly.
+_RUN_POC_KL = False
 
 
 def _pack_rope_split2_q_pages(tensor, nope_dim, rope_dim):
@@ -891,7 +913,7 @@ def test_mla(
                 decode_qlen,
             )
             return
-        if variant.wip:
+        if variant.wip and not _RUN_POC_KL:
             ret["mi400:variant"] = variant.name
             ret["mi400:reason"] = "WIP"
             aiter.logger.info(
@@ -1019,6 +1041,11 @@ def test_mla(
             cos_diff,
             "passed" if passed else "FAILED",
         )
+
+        if _RUN_POC_KL:
+            # poc_kl parity mode: one correctness launch per kernel only, no
+            # perf loop (keeps mi400:us/TFLOPS/TB/s as None from init above).
+            return
 
         # Performance: zero-initialized split/out buffers make the repeated
         # launches safe, so time the kernel over the standard perftest loop.
@@ -1338,6 +1365,14 @@ parser.add_argument(
     auto (default): run mi400 sweep iff get_gfx()=="gfx1250".
     on: force the mi400 sweep. off: never run the mi400 sweep.""",
 )
+parser.add_argument(
+    "--poc_kl",
+    choices=["on", "off"],
+    default="on",
+    help="""Test ONLY the exact cases from poc_kl/mi400/mla/run.sh (4 cases:
+    qh16 16mx1/16mx2/16mx4 + qh64 16mx4). Implies the mi400 path and force-runs
+    WIP variants. Overrides the mi400 cartesian sweep. Default: off.""",
+)
 
 
 args = parser.parse_args()
@@ -1350,7 +1385,14 @@ def _detect_gfx():
         return None
 
 
-_run_mi400 = args.mi400 == "on" or (args.mi400 == "auto" and _detect_gfx() == "gfx1250")
+_run_poc_kl = args.poc_kl == "on"
+# poc_kl parity implies the mi400 fp8 decode path.
+_run_mi400 = (
+    _run_poc_kl
+    or args.mi400 == "on"
+    or (args.mi400 == "auto" and _detect_gfx() == "gfx1250")
+)
+_RUN_POC_KL = _run_poc_kl
 
 if _run_mi400:
     # mi400 reuses the standard driver + test_mla(mi400=True); override the
@@ -1358,7 +1400,7 @@ if _run_mi400:
     # WIP / unsupported combos self-skip inside the mi400 check.
     args.dtype = [dtypes.fp8]
     args.kv_dtype = [dtypes.fp8]
-    args.nhead = _MI400_NHEAD
+    args.nhead = _POC_KL_NHEAD if _run_poc_kl else _MI400_NHEAD
     args.ctxLen = _MI400_CTX_LENS
     args.batchSize = _MI400_BATCH_SIZES
     args.split_per_batch = _MI400_SPLIT_PER_BATCH
@@ -1370,9 +1412,24 @@ if _run_mi400:
 mi400_failures = []
 for nhead, decode_qlen in args.nhead:
     df = []
-    for dtype, kvtype, ctx_len, batch_size, split_per_batch in itertools.product(
-        args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.split_per_batch
-    ):
+    if _run_poc_kl:
+        # Exact run.sh cases for this (nhead, decode_qlen) variant only.
+        _combos = [
+            (ctx, batch, split)
+            for (n, dq, batch, ctx, split) in _POC_KL_CASES
+            if (n, dq) == (nhead, decode_qlen)
+        ]
+        _param_iter = [
+            (dtype, kvtype, ctx, batch, split)
+            for dtype in args.dtype
+            for kvtype in args.kv_dtype
+            for (ctx, batch, split) in _combos
+        ]
+    else:
+        _param_iter = itertools.product(
+            args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.split_per_batch
+        )
+    for dtype, kvtype, ctx_len, batch_size, split_per_batch in _param_iter:
         if check_support(dtype, kvtype, nhead):
             ret = test_mla(
                 ctx_len,
