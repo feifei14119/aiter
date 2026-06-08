@@ -173,8 +173,8 @@ _MI400_VARIANT_BY_KEY = {(v.nhead, v.decode_qlen): v for v in _MI400_KERNEL_VARI
 # mi400 driver sweep dims (applied as arg overrides when --mi400 is active).
 _MI400_NHEAD = [(v.nhead, v.decode_qlen) for v in _MI400_KERNEL_VARIANTS]
 _MI400_CTX_LENS = [16384]#[65, 128, 257, 578]
-_MI400_BATCH_SIZES = list(range(1, 64))
-_MI400_SPLIT_PER_BATCH = list(range(1, 8))
+_MI400_BATCH_SIZES = list(range(1, 65))
+_MI400_SPLIT_PER_BATCH = list(range(1, 9))
 _MI400_NO_SPLIT_KV_KEYS = {
     (16, 1),  # qh16-q1-16mx1-32nx4-np-3p
     (16, 2),  # qh16-q2-16mx2-32nx4-np-3p
