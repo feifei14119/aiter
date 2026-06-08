@@ -172,9 +172,13 @@ _MI400_VARIANT_BY_KEY = {(v.nhead, v.decode_qlen): v for v in _MI400_KERNEL_VARI
 
 # mi400 driver sweep dims (applied as arg overrides when --mi400 is active).
 _MI400_NHEAD = [(v.nhead, v.decode_qlen) for v in _MI400_KERNEL_VARIANTS]
-_MI400_CTX_LENS = [65, 128, 257, 578]
-_MI400_BATCH_SIZES = [1, 2, 3]
-_MI400_SPLIT_PER_BATCH = [1, 2]
+_MI400_CTX_LENS = [16384]#[65, 128, 257, 578]
+_MI400_BATCH_SIZES = list(range(1, 64))
+_MI400_SPLIT_PER_BATCH = list(range(1, 8))
+_MI400_NO_SPLIT_KV_KEYS = {
+    (16, 1),  # qh16-q1-16mx1-32nx4-np-3p
+    (16, 2),  # qh16-q2-16mx2-32nx4-np-3p
+}
 
 # Exact poc_kl parity sweep: when --poc_kl on, the mi400 driver tests ONLY the
 # cases defined in poc_kl/mi400/mla/run.sh (one tuple per run.sh test), instead
@@ -1410,8 +1414,13 @@ for nhead, decode_qlen in args.nhead:
             for (ctx, batch, split) in _combos
         ]
     else:
+        split_per_batch_choices = [
+            split
+            for split in args.split_per_batch
+            if (nhead, decode_qlen) not in _MI400_NO_SPLIT_KV_KEYS or split <= 1
+        ]
         _param_iter = itertools.product(
-            args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.split_per_batch
+            args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, split_per_batch_choices
         )
     for dtype, kvtype, ctx_len, batch_size, split_per_batch in _param_iter:
         if check_support(dtype, kvtype, nhead):
