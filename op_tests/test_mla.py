@@ -172,7 +172,7 @@ _MI400_VARIANT_BY_KEY = {(v.nhead, v.decode_qlen): v for v in _MI400_KERNEL_VARI
 
 # mi400 driver sweep dims (applied as arg overrides when --mi400 is active).
 _MI400_NHEAD = [(v.nhead, v.decode_qlen) for v in _MI400_KERNEL_VARIANTS]
-_MI400_CTX_LENS = [16384]#[65, 128, 257, 578]
+_MI400_CTX_LENS = [16384]  # [65, 128, 257, 578]
 _MI400_BATCH_SIZES = list(range(1, 65))
 _MI400_SPLIT_PER_BATCH = list(range(1, 9))
 _MI400_NO_SPLIT_KV_KEYS = {
@@ -1420,7 +1420,11 @@ for nhead, decode_qlen in args.nhead:
             if (nhead, decode_qlen) not in _MI400_NO_SPLIT_KV_KEYS or split <= 1
         ]
         _param_iter = itertools.product(
-            args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, split_per_batch_choices
+            args.dtype,
+            args.kv_dtype,
+            args.ctxLen,
+            args.batchSize,
+            split_per_batch_choices,
         )
     for dtype, kvtype, ctx_len, batch_size, split_per_batch in _param_iter:
         if check_support(dtype, kvtype, nhead):
