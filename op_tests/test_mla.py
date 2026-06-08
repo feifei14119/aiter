@@ -138,8 +138,8 @@ def torch_mla_extend(
 # Merged into the standard test_mla driver: when --mi400 is active, the driver
 # overrides its sweep dims to the mi400 combos and test_mla() routes each
 # (nhead=Gqa, decode_qlen, batch, ctx_len) combo through the mi400 fp8 decode
-# check below. Unsupported (Gqa, decode_qlen) combos and WIP variants
-# are skipped. Exercises the shader variants registered in
+# check below. Unsupported (Gqa, decode_qlen) combos are skipped.
+# Exercises the shader variants registered in
 # hsa/gfx1250/mla/mla_asm.csv. Active only when get_gfx() == "gfx1250".
 # ###########################################################################
 
@@ -149,11 +149,6 @@ class MlaMi400KernelVariant:
     name: str
     nhead: int
     decode_qlen: int
-    # WIP variants are skipped. Their stage1 asm kernel has not yet been
-    # reconciled against a stable golden, so
-    # numerics are known-bad (qh16-q2: cos~1.0; qh64-q1: non-finite). Keep them
-    # listed for dispatch documentation; flip to False once stage1 is fixed.
-    wip: bool = False
 
 
 _MI400_KERNEL_VARIANTS = [
@@ -172,7 +167,7 @@ _MI400_KERNEL_VARIANTS = [
 ]
 
 # Dispatch key (nhead, decode_qlen) -> variant. Source of truth for which
-# (nhead, decode_qlen) combos the mi400 decode check supports and which are WIP.
+# (nhead, decode_qlen) combos the mi400 decode check supports.
 _MI400_VARIANT_BY_KEY = {(v.nhead, v.decode_qlen): v for v in _MI400_KERNEL_VARIANTS}
 
 # mi400 driver sweep dims (applied as arg overrides when --mi400 is active).
@@ -188,8 +183,7 @@ _MI400_SPLIT_PER_BATCH = [1, 2]
 #   (nhead, decode_qlen, batch, ctx_lens, split_per_batch)
 # Mapping from run.sh args: gqa_ratio->nhead, kernel 16mx{N}->decode_qlen,
 # batch->batch, kv_seq_lens->ctx_lens, passes->split_per_batch.
-# WIP variants (qh16-q2, qh64-q1) are force-run in this mode since run.sh runs
-# all four. block_size=64 / fp8 / rope-split2 are already fixed in the mi400
+# block_size=64 / fp8 / rope-split2 are already fixed in the mi400
 # path, matching run.sh's block_size=64 data_type=2 rope_split=2.
 _POC_KL_CASES = [
     (16, 1, 2, 578, 1),  # test_kl_mla_a8w8_qh16_1tg_16mx1_32nx4_np_3p_test
@@ -201,8 +195,7 @@ _POC_KL_CASES = [
 # preserved. Used as args.nhead grouping when --poc_kl on.
 _POC_KL_NHEAD = list(dict.fromkeys((n, dq) for (n, dq, _b, _c, _s) in _POC_KL_CASES))
 
-# Set True at runtime when --poc_kl on; consulted by the mi400 check to force-run
-# WIP variants so the sweep matches run.sh exactly.
+# Set True at runtime when --poc_kl on; selects the exact run.sh case sweep.
 _RUN_POC_KL = False
 
 
@@ -888,9 +881,8 @@ def test_mla(
         # mi400 (gfx1250) fp8 MLA decode, dispatched as a decode backend peer of
         # the bf16/fp8/gluon paths. It derives fp8 + rope-split2 packed Q/KV
         # from the standard bf16 inputs and checks against _ref_mla_mi400.
-        # Dispatch key is (nhead, decode_qlen); unsupported combos and WIP
-        # variants are recorded as skipped (not failures) so the driver does
-        # not abort.
+        # Dispatch key is (nhead, decode_qlen); unsupported combos are recorded
+        # as skipped (not failures) so the driver does not abort.
         ret["mi400:nhead"] = nhead
         ret["mi400:decode_qlen"] = decode_qlen
         ret["mi400:batch"] = batch_size
@@ -911,14 +903,6 @@ def test_mla(
                 "mla_decode-mi400 [nhead=%d decode_qlen=%d]: skipped (unsupported dispatch combo)",
                 nhead,
                 decode_qlen,
-            )
-            return
-        if variant.wip and not _RUN_POC_KL:
-            ret["mi400:variant"] = variant.name
-            ret["mi400:reason"] = "WIP"
-            aiter.logger.info(
-                "mla_decode-mi400 [%s]: skipped (WIP stage1)",
-                variant.name,
             )
             return
 
@@ -1370,8 +1354,8 @@ parser.add_argument(
     choices=["on", "off"],
     default="on",
     help="""Test ONLY the exact cases from poc_kl/mi400/mla/run.sh (4 cases:
-    qh16 16mx1/16mx2/16mx4 + qh64 16mx4). Implies the mi400 path and force-runs
-    WIP variants. Overrides the mi400 cartesian sweep. Default: off.""",
+    qh16 16mx1/16mx2/16mx4 + qh64 16mx4). Implies the mi400 path. Overrides the
+    mi400 cartesian sweep. Default: off.""",
 )
 
 
@@ -1397,7 +1381,7 @@ _RUN_POC_KL = _run_poc_kl
 if _run_mi400:
     # mi400 reuses the standard driver + test_mla(mi400=True); override the
     # sweep dims to the mi400 fp8 decode combos. nhead carries (gqa, decode_qlen);
-    # WIP / unsupported combos self-skip inside the mi400 check.
+    # unsupported combos self-skip inside the mi400 check.
     args.dtype = [dtypes.fp8]
     args.kv_dtype = [dtypes.fp8]
     args.nhead = _POC_KL_NHEAD if _run_poc_kl else _MI400_NHEAD
