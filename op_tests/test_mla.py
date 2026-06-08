@@ -187,8 +187,8 @@ _MI400_NO_SPLIT_KV_KEYS = {
 #   (nhead, decode_qlen, batch, ctx_lens, split_per_batch)
 # Mapping from run.sh args: gqa_ratio->nhead, kernel 16mx{N}->decode_qlen,
 # batch->batch, kv_seq_lens->ctx_lens, passes->split_per_batch.
-# block_size=64 / fp8 / rope-split2 are already fixed in the mi400
-# path, matching run.sh's block_size=64 data_type=2 rope_split=2.
+# block_size=64 / fp8 are fixed in the mi400 path. Q layout is controlled
+# by _Q_PATTERN below.
 _POC_KL_CASES = [
     (16, 1, 2, 578, 1),  # test_kl_mla_a8w8_qh16_1tg_16mx1_32nx4_np_3p_test
     (16, 2, 2, 578, 1),  # test_kl_mla_a8w8_qh16_1tg_16mx2_32nx4_np_3p_test
@@ -201,6 +201,12 @@ _POC_KL_NHEAD = list(dict.fromkeys((n, dq) for (n, dq, _b, _c, _s) in _POC_KL_CA
 
 # Set True at runtime when --poc_kl on; selects the exact run.sh case sweep.
 _RUN_POC_KL = False
+
+# Q layout selector for mi400:
+#   0: nhead*(nope+rope) original contiguous per-head layout
+#   1: [..., nhead*nope] + [..., nhead*rope] (current rope_split2 layout)
+#   3: nhead*(nope+rope) per-head layout with a 768-byte padded row stride
+_Q_PATTERN = 3
 
 
 def _pack_rope_split2_q_pages(tensor, nope_dim, rope_dim):
@@ -216,6 +222,39 @@ def _pack_rope_split2_q_pages(tensor, nope_dim, rope_dim):
         dim=-1,
     )
     return packed.reshape(shape).contiguous()
+
+
+def _pack_rope_split3_q_pages(tensor, nope_dim, rope_dim, padded_stride_bytes=768):
+    shape = tensor.shape
+    assert shape[-1] == nope_dim + rope_dim
+    elem_size = tensor.element_size()
+    if padded_stride_bytes % elem_size != 0:
+        raise ValueError("rope_split3 padded stride must be element aligned")
+    padded_dim = padded_stride_bytes // elem_size
+    if padded_dim < shape[-1]:
+        raise ValueError(
+            f"rope_split3 padded dim {padded_dim} is smaller than Q dim {shape[-1]}"
+        )
+
+    # Mirror poc_kl pack_q_page1_padded(): each logical Q row stores
+    # [nope][rope] followed by zero padding up to a 768-byte row stride.
+    rows = tensor.reshape(-1, shape[-1])
+    padded = torch.zeros(
+        (rows.shape[0], padded_dim),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    padded[:, : shape[-1]].copy_(rows)
+    return torch.as_strided(
+        padded,
+        size=shape,
+        stride=(
+            shape[1] * shape[2] * padded_dim,
+            shape[2] * padded_dim,
+            padded_dim,
+            1,
+        ),
+    )
 
 
 def _pack_rope_split2_kv_pages(tensor, nope_dim, rope_dim):
@@ -351,12 +390,28 @@ def _make_mla_mi400_kv_case(
 def _make_mla_mi400_q_case(
     *, q_fp8, batch, decode_qlen, nhead, qk_head_dim, v_head_dim
 ):
-    q = _pack_rope_split2_q_pages(
-        q_fp8.view(batch, decode_qlen, nhead, qk_head_dim),
-        v_head_dim,
-        qk_head_dim - v_head_dim,
-    ).view(batch * decode_qlen, nhead, qk_head_dim)
-    return q
+    q = q_fp8.view(batch, decode_qlen, nhead, qk_head_dim)
+    if _Q_PATTERN == 1:
+        q = _pack_rope_split2_q_pages(
+            q,
+            v_head_dim,
+            qk_head_dim - v_head_dim,
+        )
+    elif _Q_PATTERN == 3:
+        q = _pack_rope_split3_q_pages(
+            q,
+            v_head_dim,
+            qk_head_dim - v_head_dim,
+        )
+    elif _Q_PATTERN != 0:
+        raise ValueError(f"_Q_PATTERN must be 0, 1, or 3, got {_Q_PATTERN}")
+    if _Q_PATTERN == 3:
+        return torch.as_strided(
+            q,
+            size=(batch * decode_qlen, nhead, qk_head_dim),
+            stride=(nhead * q.stride(2), q.stride(2), q.stride(3)),
+        )
+    return q.contiguous().view(batch * decode_qlen, nhead, qk_head_dim)
 
 
 def _ref_mla_mi400(
@@ -870,7 +925,7 @@ def test_mla(
 
     def test_absorb_decode_mi400():
         # mi400 (gfx1250) fp8 MLA decode, dispatched as a decode backend peer of
-        # the bf16/fp8/gluon paths. It derives fp8 + rope-split2 packed Q/KV
+        # the bf16/fp8/gluon paths. It derives fp8 + selected Q/KV layout
         # from the standard bf16 inputs and checks against _ref_mla_mi400.
         # Dispatch key is (nhead, decode_qlen); unsupported combos are recorded
         # as skipped (not failures) so the driver does not abort.

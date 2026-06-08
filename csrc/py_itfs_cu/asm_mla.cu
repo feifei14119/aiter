@@ -263,7 +263,12 @@ static void mla_decode_mi400_dispatch(
                     num_kv_splits_indptr != nullptr,
                 __func__,
                 ": gfx1250 MLA minimal smoke only supports non-persistent decode");
-    AITER_CHECK(Q->is_contiguous(), __func__, ": only support Q.is_contiguous() for now");
+    const bool q_has_supported_layout =
+        Q->stride(2) == 1 && Q->stride(1) >= Q->size(2) &&
+        Q->stride(0) == Q->size(1) * Q->stride(1);
+    AITER_CHECK(q_has_supported_layout,
+                __func__,
+                ": only support packed Q layout with contiguous head dim and optional padded head stride");
     AITER_CHECK(Q->dtype() == AITER_DTYPE_fp8 && KV->dtype() == AITER_DTYPE_fp8,
                 __func__,
                 ": only supports fp8/fp8 for minimal smoke");
