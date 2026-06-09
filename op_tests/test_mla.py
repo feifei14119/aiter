@@ -184,20 +184,20 @@ _MI400_NO_SPLIT_KV_KEYS = {
 # cases defined in poc_kl/mi400/mla/run.sh (one tuple per run.sh test), instead
 # of the cartesian sweep above. Each tuple is the aiter equivalent of a run.sh
 # `test_kl_mla_*` case:
-#   (nhead, decode_qlen, batch, ctx_lens, split_per_batch)
+#   (nhead, decode_qlen, batch, ctx_lens, split_per_batch, mask)
 # Mapping from run.sh args: gqa_ratio->nhead, kernel 16mx{N}->decode_qlen,
 # batch->batch, kv_seq_lens->ctx_lens, passes->split_per_batch.
 # block_size=64 / fp8 are fixed in the mi400 path. Q layout is controlled
 # by _Q_PATTERN below.
 _POC_KL_CASES = [
-    (16, 1, 2, 578, 1),  # test_kl_mla_a8w8_qh16_1tg_16mx1_32nx4_np_3p_test
-    (16, 2, 2, 578, 1),  # test_kl_mla_a8w8_qh16_1tg_16mx2_32nx4_np_3p_test
-    (64, 1, 4, 962, 2),  # test_kl_mla_a8w8_qh64_1tg_16mx4_64nx1_np_test
-    (16, 4, 4, 578, 2),  # test_kl_mla_a8w8_qh16_1tg_16mx4_64nx1_np_test
+    (16, 1, 1, 1024, 1, 0),  # test_kl_mla_a8w8_qh16_1tg_16mx1_32nx4_np_3p_test
+    (16, 2, 2, 1024, 2, 1),  # test_kl_mla_a8w8_qh16_1tg_16mx2_32nx4_np_3p_test
+    (64, 1, 4, 962, 2, 0),  # test_kl_mla_a8w8_qh64_1tg_16mx4_64nx1_np_test
+    (16, 4, 4, 578, 2, 1),  # test_kl_mla_a8w8_qh16_1tg_16mx4_64nx1_np_test
 ]
 # Distinct (nhead, decode_qlen) variant keys present in _POC_KL_CASES, order
 # preserved. Used as args.nhead grouping when --poc_kl on.
-_POC_KL_NHEAD = list(dict.fromkeys((n, dq) for (n, dq, _b, _c, _s) in _POC_KL_CASES))
+_POC_KL_NHEAD = list(dict.fromkeys((n, dq) for (n, dq, _b, _c, _s, _m) in _POC_KL_CASES))
 
 # Set True at runtime when --poc_kl on; selects the exact run.sh case sweep.
 _RUN_POC_KL = False
@@ -414,6 +414,15 @@ def _make_mla_mi400_q_case(
     return q.contiguous().view(batch * decode_qlen, nhead, qk_head_dim)
 
 
+def _apply_causal_mask_(logits):
+    # Matches the causal/tail mask shape used by ref_masked_attention().
+    _, s_q, s_k = logits.shape
+    mask = torch.ones(s_q, s_k, dtype=torch.bool, device=logits.device).tril(
+        diagonal=s_k - s_q
+    )
+    logits.masked_fill_(mask.logical_not().unsqueeze(0), float("-inf"))
+
+
 def _ref_mla_mi400(
     case,
     q_ref,
@@ -425,6 +434,7 @@ def _ref_mla_mi400(
     nhead_kv,
     qk_head_dim,
     v_head_dim,
+    mask,
 ):
     outputs = []
     num_pages = case["num_pages_per_batch"]
@@ -443,6 +453,8 @@ def _ref_mla_mi400(
         value = kv[..., :v_head_dim]
 
         logits = torch.einsum("qhd,kmd->hqk", q, key) * (1.0 / (qk_head_dim**0.5))
+        if mask:
+            _apply_causal_mask_(logits)
         weights = torch.softmax(logits, dim=-1)
         outputs.append(torch.einsum("hqk,kmd->qhd", weights, value).to(torch.bfloat16))
     return torch.cat(outputs, dim=0)
@@ -478,6 +490,7 @@ def test_mla(
     return_lse=False,
     sequential_page_indices=False,
     mi400=False,
+    mask=1,
 ):
     ret = {}
 
@@ -934,6 +947,7 @@ def test_mla(
         ret["mi400:batch"] = batch_size
         ret["mi400:ctx"] = ctx_lens
         ret["mi400:num_kv_splits"] = split_per_batch
+        ret["mi400:mask"] = mask
         ret["mi400:skipped"] = True
         ret["mi400:passed"] = None
         ret["mi400:finite"] = None
@@ -1052,6 +1066,7 @@ def test_mla(
                 nhead_kv,
                 qk_head_dim,
                 v_head_dim,
+                mask,
             )
             cos_diff = _cosine_diff(out_check, expected)
         else:
@@ -1350,6 +1365,15 @@ parser.add_argument(
     e.g.: -ms 32""",
 )
 parser.add_argument(
+    "--mask",
+    type=int,
+    nargs="+",
+    choices=[0, 1],
+    default=[1],
+    help="""mi400 attention mask selector: 0 disables causal/tail mask, 1 enables it.
+    e.g.: --mask 0 1""",
+)
+parser.add_argument(
     "--varlen",
     action="store_true",
     help="""variable kv seqlens per batch. Default: False.
@@ -1426,15 +1450,15 @@ for nhead, decode_qlen in args.nhead:
     if _run_poc_kl:
         # Exact run.sh cases for this (nhead, decode_qlen) variant only.
         _combos = [
-            (ctx, batch, split)
-            for (n, dq, batch, ctx, split) in _POC_KL_CASES
+            (ctx, batch, split, mask)
+            for (n, dq, batch, ctx, split, mask) in _POC_KL_CASES
             if (n, dq) == (nhead, decode_qlen)
         ]
         _param_iter = [
-            (dtype, kvtype, ctx, batch, split)
+            (dtype, kvtype, ctx, batch, split, mask)
             for dtype in args.dtype
             for kvtype in args.kv_dtype
-            for (ctx, batch, split) in _combos
+            for (ctx, batch, split, mask) in _combos
         ]
     else:
         split_per_batch_choices = [
@@ -1442,14 +1466,16 @@ for nhead, decode_qlen in args.nhead:
             for split in args.split_per_batch
             if (nhead, decode_qlen) not in _MI400_NO_SPLIT_KV_KEYS or split <= 1
         ]
+        mask_choices = args.mask if _run_mi400 else [1]
         _param_iter = itertools.product(
             args.dtype,
             args.kv_dtype,
             args.ctxLen,
             args.batchSize,
             split_per_batch_choices,
+            mask_choices,
         )
-    for dtype, kvtype, ctx_len, batch_size, split_per_batch in _param_iter:
+    for dtype, kvtype, ctx_len, batch_size, split_per_batch, mask in _param_iter:
         if check_support(dtype, kvtype, nhead):
             ret = test_mla(
                 ctx_len,
@@ -1468,6 +1494,7 @@ for nhead, decode_qlen in args.nhead:
                 return_lse=args.return_lse,
                 sequential_page_indices=args.sequential_page_indices,
                 mi400=_run_mi400,
+                mask=mask,
             )
             df.append(ret)
             if (
