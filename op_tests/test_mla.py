@@ -158,6 +158,11 @@ _MI400_KERNEL_VARIANTS = [
         nhead=16,
         decode_qlen=2,
     ),
+    MlaMi400KernelVariant(
+        name="qh32-q1-32mx1-32nx4-np-3p",
+        nhead=32,
+        decode_qlen=1,
+    ),
     MlaMi400KernelVariant(name="qh16-q4-16mx4-64nx1-np", nhead=16, decode_qlen=4),
     MlaMi400KernelVariant(
         name="qh64-q1-16mx4-64nx1-np",
@@ -192,6 +197,7 @@ _MI400_NO_SPLIT_KV_KEYS = {
 _POC_KL_CASES = [
     (16, 1, 1, 1024, 1, 0),  # test_kl_mla_a8w8_qh16_1tg_16mx1_32nx4_np_3p_test
     (16, 2, 2, 1024, 2, 1),  # test_kl_mla_a8w8_qh16_1tg_16mx2_32nx4_np_3p_test
+    (32, 1, 1, 2048, 2, 0),  # test_kl_mla_a8w8_qh32_1tg_32mx1_32nx4_np_3p_test
     (64, 1, 4, 962, 2, 0),  # test_kl_mla_a8w8_qh64_1tg_16mx4_64nx1_np_test
     (16, 4, 4, 578, 2, 1),  # test_kl_mla_a8w8_qh16_1tg_16mx4_64nx1_np_test
 ]
@@ -1404,8 +1410,8 @@ parser.add_argument(
     "--poc_kl",
     choices=["on", "off"],
     default="on",
-    help="""Test ONLY the exact cases from poc_kl/mi400/mla/run.sh (4 cases:
-    qh16 16mx1/16mx2/16mx4 + qh64 16mx4). Implies the mi400 path. Overrides the
+    help="""Test ONLY the exact cases from poc_kl/mi400/mla/run.sh (5 cases:
+    qh16 16mx1/16mx2/16mx4 + qh32 32mx1 + qh64 16mx4). Implies the mi400 path. Overrides the
     mi400 cartesian sweep. Default: off.""",
 )
 

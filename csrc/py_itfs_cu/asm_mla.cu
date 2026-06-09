@@ -291,6 +291,7 @@ static void mla_decode_mi400_dispatch(
     // that has no registered kernel before touching the dispatch path.
     const bool supported_variant =
         (gqa_ratio == 16 && (max_seqlen_q == 1 || max_seqlen_q == 2 || max_seqlen_q == 4)) ||
+        (gqa_ratio == 32 && max_seqlen_q == 1) ||
         (gqa_ratio == 64 && max_seqlen_q == 1);
     AITER_CHECK(supported_variant,
                 __func__,
@@ -298,7 +299,7 @@ static void mla_decode_mi400_dispatch(
                 gqa_ratio,
                 " max_seqlen_q=",
                 max_seqlen_q,
-                " (supported: gqa16 x qSeqLen{1,2,4}, gqa64 x qSeqLen1)");
+                " (supported: gqa16 x qSeqLen{1,2,4}, gqa32 x qSeqLen1, gqa64 x qSeqLen1)");
     const int sub_Q = gqa_ratio * max_seqlen_q;
     AITER_CHECK(page_size == 64, __func__, ": only support page_size == 64 for minimal smoke");
     AITER_CHECK(Q->size(2) == 576, __func__, ": only support Q head dim 576 for minimal smoke");
@@ -854,7 +855,10 @@ void mla_decode_stage1_asm_fwd(
                 args.s_MQA = gqa_ratio;
             }
         }else if (q_type == "fp8" && kv_type == "fp8"){
-            if((max_seqlen_q == 4) && persistent){
+            if((max_seqlen_q == 1) && !persistent){
+                config_max_seqlen_q = 1;
+                sub_Q = 32;
+            } else if((max_seqlen_q == 4) && persistent){
                 config_max_seqlen_q = 4;
                 sub_Q = 128;
             } else if((max_seqlen_q == 2) && persistent){
@@ -862,7 +866,7 @@ void mla_decode_stage1_asm_fwd(
                 sub_Q = 128;
             } else {
                 AITER_CHECK(false, __func__,
-                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=2,4 in persistent mode");
+                    ": fp8/fp8 with gqa_ratio=32 only supports non-persistent decode_qlen=1 or persistent decode_qlen=2,4");
             }
         }
     } else if (gqa_ratio == 64){
