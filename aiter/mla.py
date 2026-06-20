@@ -4,6 +4,7 @@
 # user interface
 
 import functools
+import os
 from typing import Optional
 import torch
 import triton
@@ -14,6 +15,13 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.core import is_experimental_enabled
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
+
+# Switch for the MLA decode stage-2 (split-KV softmax reduction).
+# Default: pure-PyTorch implementation, which avoids the Triton stage-2 kernel
+# (_fwd_kernel_stage2_asm). The Triton kernel is JIT-compiled on first launch
+# and that compile is extremely slow on gfx1250 and can stall cuda-graph
+# capture. Set AITER_MLA_STAGE2_TORCH=0 to fall back to the Triton kernel.
+USE_TORCH_STAGE2 = os.environ.get("AITER_MLA_STAGE2_TORCH", "1") == "1"
 
 
 @triton.jit
@@ -172,6 +180,90 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
     return num_kv_splits, num_kv_splits_indptr
 
 
+def _stage2_combine_torch(
+    logits,
+    attn_lse,
+    o,
+    final_lse,
+    qo_indptr,
+    kv_indptr,
+    kv_last_page_lens,
+    num_kv_splits_indptr,
+    page_size,
+    kv_indptr_is_page_level,
+    maybe_final_out,
+    num_kv_splits,
+    bs,
+    total_s,
+    nhead,
+    Lv,
+    mgc,
+):
+    """Pure-PyTorch equivalent of the Triton kernel `_fwd_kernel_stage2_asm`.
+
+    Performs the split-KV online-softmax reduction (flash-decoding combine):
+    merges the per-split partial outputs (`logits`) and per-split LSE
+    (`attn_lse`) into the final attention output, written into `o` in place.
+    When `final_lse` is provided, writes the combined LSE there too.
+
+    Implemented with standard tensor ops only (no Triton JIT), so it is
+    cuda-graph safe and avoids the very slow gfx1250 Triton compile.
+    Numerically equivalent to the kernel: per token it reduces over the first
+    `num_valid = min(splits_in_batch, cdiv(kv_seq_len, mgc))` splits.
+    """
+    device = o.device
+
+    # FINAL_OUT fast path: a single split per batch (uniform indptr ->
+    # num_max_kv_splits == BATCH_NUM iff num_kv_splits == 1) means stage1 already
+    # wrote the FINAL output as bf16 packed into the fp32 `logits` buffer; just
+    # reinterpret and copy it out (mirrors the kernel's FINAL_OUT branch).
+    if maybe_final_out and num_kv_splits == 1:
+        packed = logits.reshape(-1).view(o.dtype)[: total_s * nhead * Lv]
+        o.copy_(packed.reshape(total_s, nhead, Lv))
+        return
+
+    # Per-batch valid split count: min(splits_in_batch, cdiv(kv_seq_len, mgc)).
+    kv_counts = kv_indptr[1:] - kv_indptr[:-1]
+    if kv_indptr_is_page_level:
+        kv_seq_len = (kv_counts - 1) * page_size + kv_last_page_lens
+    else:
+        kv_seq_len = kv_counts
+    split_counts = num_kv_splits_indptr[1:] - num_kv_splits_indptr[:-1]
+    kv_seq_cdiv = (kv_seq_len + (mgc - 1)) // mgc
+    num_valid = torch.minimum(split_counts, kv_seq_cdiv)  # (bs,)
+
+    # Map each token row -> its batch (handles non-uniform qo_indptr; graph-safe,
+    # no host sync).
+    token_ids = torch.arange(total_s, device=device)
+    batch_of_token = torch.searchsorted(qo_indptr, token_ids, right=True) - 1
+    num_valid_tok = num_valid[batch_of_token].to(torch.int64)  # (total_s,)
+
+    split_ids = torch.arange(num_kv_splits, device=device)
+    valid = split_ids.view(1, num_kv_splits) < num_valid_tok.view(total_s, 1)  # (T,S)
+
+    lse = attn_lse[..., 0].to(torch.float32)  # (T, S, nhead)
+    lse = torch.where(
+        valid.unsqueeze(-1), lse, torch.full_like(lse, float("-inf"))
+    )
+    m = lse.amax(dim=1, keepdim=True)  # (T, 1, nhead)
+    w = torch.exp(lse - m)  # (T, S, nhead); invalid splits -> 0 for finite m
+    denom = w.sum(dim=1)  # (T, nhead)
+
+    # Zero out invalid-split logits before the weighted sum so any uninitialized
+    # garbage (inf/nan) in those slots cannot poison the result via 0 * inf.
+    safe_logits = torch.where(
+        valid.unsqueeze(-1).unsqueeze(-1),
+        logits.to(torch.float32),
+        torch.zeros((), dtype=torch.float32, device=device),
+    )
+    num = torch.einsum("tsh,tshd->thd", w, safe_logits)  # (T, nhead, Lv)
+    out = num / denom.unsqueeze(-1)
+    o.copy_(out.to(o.dtype))
+
+    if final_lse is not None:
+        final_lse.copy_((m.squeeze(1) + torch.log(denom)).to(final_lse.dtype))
+
+
 def mla_decode_fwd(
     q,
     kv_buffer,
@@ -322,33 +414,54 @@ def mla_decode_fwd(
             else torch.empty((1,), dtype=dtypes.fp32, device=device)
         )
 
-        _fwd_kernel_stage2_asm[grid](
-            logits,
-            attn_lse,
-            o,
-            final_lse_buf,
-            qo_indptr,
-            kv_indptr,
-            kv_last_page_lens,
-            num_kv_splits_indptr,
-            attn_lse.stride(0),
-            attn_lse.stride(2),
-            attn_lse.stride(1),
-            o.stride(0),
-            o.stride(1),
-            final_lse_buf.stride(0) if has_final_lse else 0,
-            page_size=page_size,
-            KV_INDPTR_IS_PAGE_LEVEL=page_size > 1,
-            MAYBE_FINAL_OUT=MAYBE_FINAL_OUT,
-            HAS_FINAL_LSE=has_final_lse,
-            BATCH_NUM=bs,
-            BLOCK_DV=BLOCK_DV,
-            Lv=Lv,
-            mgc=mgc,
-            num_warps=4,
-            num_stages=2,
-            **extra_kargs,
-        )
+        if USE_TORCH_STAGE2:
+            _stage2_combine_torch(
+                logits,
+                attn_lse,
+                o,
+                final_lse if has_final_lse else None,
+                qo_indptr,
+                kv_indptr,
+                kv_last_page_lens,
+                num_kv_splits_indptr,
+                page_size,
+                page_size > 1,
+                MAYBE_FINAL_OUT,
+                num_kv_splits,
+                bs,
+                total_s,
+                nhead,
+                Lv,
+                mgc,
+            )
+        else:
+            _fwd_kernel_stage2_asm[grid](
+                logits,
+                attn_lse,
+                o,
+                final_lse_buf,
+                qo_indptr,
+                kv_indptr,
+                kv_last_page_lens,
+                num_kv_splits_indptr,
+                attn_lse.stride(0),
+                attn_lse.stride(2),
+                attn_lse.stride(1),
+                o.stride(0),
+                o.stride(1),
+                final_lse_buf.stride(0) if has_final_lse else 0,
+                page_size=page_size,
+                KV_INDPTR_IS_PAGE_LEVEL=page_size > 1,
+                MAYBE_FINAL_OUT=MAYBE_FINAL_OUT,
+                HAS_FINAL_LSE=has_final_lse,
+                BATCH_NUM=bs,
+                BLOCK_DV=BLOCK_DV,
+                Lv=Lv,
+                mgc=mgc,
+                num_warps=4,
+                num_stages=2,
+                **extra_kargs,
+            )
     else:
         if num_kv_splits is None:
             num_kv_splits = get_mla_decode_fwd_max_splits(
