@@ -10,17 +10,23 @@ fp8 values to two kernels:
   - aiter  : aiter.mla.mla_decode_fwd, the gfx1250 seg asm decode. Consumes a
              page-level seg-packed KV cache ([num_pages, page_size*512 nope |
              page_size*64 pe]) and the 768-padded selected Q layout.
-  - triton : op_tests/triton_tests/utils/mla_decode_ref.decode_attention_fwd,
-             the known-good reference. Consumes a token-major interleaved KV
-             cache ([num_tokens, 1, 576]) and token-level kv_indptr/indices.
+  - triton : aiter.ops.triton.attention.mla_decode.decode_attention_fwd, the
+             EXACT kernel ATOM runs on the ATOM_USE_TRITON_MLA decode path
+             (atom/model_ops/attention_mla.py). Consumes an fp8 token-major KV
+             cache ([num_pages, page_size, 1, 576]), a dense block_table, a
+             per-row context_lens, and dequantizes fp8 KV in-kernel via k_scale.
+             Invoked exactly as ATOM does: q cast to bf16, fp8 KV + k/v_scale,
+             num_kv_splits=4, page-level block_table.
 
-triton runs in bf16 on the fp8-dequantized inputs, so it acts as the golden:
-the only difference vs aiter is the kernel, not the quantization. The headline
-pass/fail is cos_diff(aiter_o, triton_o) < threshold. Both kernels are timed
-with run_perftest and reported side by side (us / TFLOPS / TB/s).
+Both paths read the SAME fp8 Q/KV values (q cast to bf16 for triton, KV stays
+fp8 and is dequantized in-kernel with scale=1), so cos_diff isolates the kernel,
+not the quantization. The headline pass/fail is cos_diff(aiter_o, triton_o) <
+threshold. Both kernels are timed with run_perftest so triton_us faithfully
+reflects ATOM's production triton decode performance.
 
 This mirrors the historical "feed the same input to triton (good) and the seg
-path, compare the decode output" debug method, but as a repeatable UT.
+path, compare the decode output" debug method, but as a repeatable UT, and uses
+ATOM's real triton kernel so the perf delta is the true ATOM-triton-vs-aiter gap.
 
 Examples:
   # default sweep on gfx1250
@@ -45,8 +51,8 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.attention import mla_decode_stage1_asm_fwd
 from aiter.test_common import benchmark, run_perftest
 
-# triton golden
-from triton_tests.utils.mla_decode_ref import decode_attention_fwd
+# triton golden == the exact kernel ATOM uses on its ATOM_USE_TRITON_MLA path
+from aiter.ops.triton.attention.mla_decode import decode_attention_fwd
 
 # In lean containers aiter.__init__ may skip bulk op exports; register the op
 # the seg decode needs explicitly (same as test_mla_mi400.py).
@@ -221,31 +227,27 @@ def _build_case(
     )
     num_kv_splits = int(num_kv_splits)
 
-    # --- token-major views + per-query metadata (triton golden) -------------- #
-    # Physical token index = physical_page * page_size + offset.
-    k_buffer_tok = kv_ref_fp8.reshape(total_pages * page_size, nhead_kv, qk_head_dim).to(
-        torch.bfloat16
-    )
-    v_buffer_tok = k_buffer_tok[..., :v_head_dim]  # value == nope part
+    # --- ATOM triton inputs (exactly as attention_mla.py builds them) --------- #
+    # ATOM: k_buffer = kv_cache.unsqueeze(2) -> token-major [num_pages, page_size,
+    # 1, 576] fp8; v_buffer = k_buffer[..., :kv_lora]; q cast to bf16; dense
+    # block_table [rows, npb] of physical page ids; per-row context_lens; the
+    # kernel pages internally via kv_loc = page*page_size + offset.
+    k_buffer_atom = kv_ref_fp8  # [total_pages, page_size, 1, 576] fp8, token-major
+    v_buffer_atom = k_buffer_atom[..., :v_head_dim]
     q_tok = q_fp8.view(total_q, nhead, qk_head_dim).to(torch.bfloat16)
 
-    kv_indptr_tok = [0]
-    kv_indices_tok = []
+    # dense block_table + per-row context_lens, one row per decode query token.
+    block_table = torch.zeros((total_q, npb), dtype=torch.int32, device=device)
+    context_lens = torch.empty(total_q, dtype=torch.int32, device=device)
     for b in range(batch):
-        # physical token ids for this batch's logical tokens (length ctx_lens)
-        batch_tok_phys = []
-        for j in range(npb):
-            pp = int(kv_indices[b * npb + j])
-            ntok = page_size if j < npb - 1 else last_page_len
-            base = pp * page_size
-            batch_tok_phys.extend(range(base, base + ntok))
+        pages_b = kv_indices[b * npb : (b + 1) * npb]  # physical page ids (shuffled)
         for qpos in range(decode_qlen):
+            row = b * decode_qlen + qpos
+            block_table[row] = pages_b
             # causal: query token qpos sees ctx_lens - (decode_qlen-1-qpos) tokens
-            seq_len_row = ctx_lens - (decode_qlen - 1 - qpos) if mask else ctx_lens
-            kv_indices_tok.extend(batch_tok_phys[:seq_len_row])
-            kv_indptr_tok.append(len(kv_indices_tok))
-    kv_indptr_tok = torch.tensor(kv_indptr_tok, dtype=torch.int32, device=device)
-    kv_indices_tok = torch.tensor(kv_indices_tok, dtype=torch.int32, device=device)
+            context_lens[row] = (
+                ctx_lens - (decode_qlen - 1 - qpos) if mask else ctx_lens
+            )
 
     return {
         "device": device,
@@ -265,12 +267,12 @@ def _build_case(
         "qo_indptr": qo_indptr,
         "num_kv_splits": num_kv_splits,
         "num_kv_splits_indptr": num_kv_splits_indptr,
-        # triton inputs
+        # triton (ATOM) inputs
         "q_tok": q_tok,
-        "k_buffer_tok": k_buffer_tok,
-        "v_buffer_tok": v_buffer_tok,
-        "kv_indptr_tok": kv_indptr_tok,
-        "kv_indices_tok": kv_indices_tok,
+        "k_buffer_atom": k_buffer_atom,
+        "v_buffer_atom": v_buffer_atom,
+        "block_table": block_table,
+        "context_lens": context_lens,
     }
 
 
@@ -308,28 +310,36 @@ def _run_aiter(case, nhead, decode_qlen, *, perf):
 
 
 def _run_triton(case, nhead, triton_kv_splits, *, perf):
+    # Mirror ATOM attention_mla.py: q bf16, fp8 KV + k/v_scale dequant in-kernel,
+    # dense block_table + per-row context_lens, page-level paging, lse output.
+    device = case["device"]
     out = torch.empty(
         (case["total_q"], nhead, case["v_head_dim"]), dtype=torch.bfloat16
     )
+    lse = torch.empty((case["total_q"], nhead), dtype=torch.float32, device=device)
     attn_logits = torch.empty(
         (case["total_q"], nhead, triton_kv_splits, case["v_head_dim"] + 1),
         dtype=torch.float32,
     )
+    one = torch.ones((), dtype=torch.float32, device=device)  # kv fp8 scale == 1
     fn_args = (
         case["q_tok"],
-        case["k_buffer_tok"],
-        case["v_buffer_tok"],
+        case["k_buffer_atom"],
+        case["v_buffer_atom"],
         out,
-        case["kv_indptr_tok"],
-        case["kv_indices_tok"],
+        lse,
+        case["block_table"],
+        case["context_lens"],
         attn_logits,
         triton_kv_splits,
         case["sm_scale"],
+        case["page_size"],
     )
+    fn_kwargs = dict(k_scale=one, v_scale=one)
     if perf:
-        _, us = run_perftest(decode_attention_fwd, *fn_args)
+        _, us = run_perftest(decode_attention_fwd, *fn_args, **fn_kwargs)
         return out, us
-    decode_attention_fwd(*fn_args)
+    decode_attention_fwd(*fn_args, **fn_kwargs)
     return out, None
 
 
@@ -393,7 +403,8 @@ def test_mla_decode_triton(
         page_indices_oob=page_indices_oob,
         shuffle_pages=shuffle_pages,
     )
-    triton_kv_splits = min(triton_kv_splits, max(1, ctx_lens))
+    # ATOM hardcodes num_kv_splits=4 for its triton decode; keep it fixed to
+    # faithfully reflect ATOM's launch (do not adapt to ctx).
     ret["num_kv_splits"] = case["num_kv_splits"]
     ret["triton_kv_splits"] = triton_kv_splits
 
@@ -436,8 +447,9 @@ def test_mla_decode_triton(
         + total_q * nhead * qk_head_dim * fp8_b
         + total_q * nhead * v_head_dim * bf16_b
     )
+    # ATOM triton reads fp8 KV (dequant in-kernel) + bf16 Q + bf16 out.
     bytes_triton = (
-        total_kv * case["nhead_kv"] * qk_head_dim * bf16_b
+        total_kv * case["nhead_kv"] * qk_head_dim * fp8_b
         + total_q * nhead * qk_head_dim * bf16_b
         + total_q * nhead * v_head_dim * bf16_b
     )
@@ -514,8 +526,9 @@ def _build_parser():
     parser.add_argument(
         "--triton-kv-splits",
         type=int,
-        default=16,
-        help="num_kv_splits for the triton golden (numeric-invariant; affects triton perf).",
+        default=4,
+        help="num_kv_splits for the ATOM triton decode (ATOM hardcodes 4; "
+        "numeric-invariant, affects triton perf).",
     )
     parser.add_argument(
         "--page-indices-oob",
