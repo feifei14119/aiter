@@ -235,6 +235,21 @@ def _make_mla_mi400_kv_case(
     page_indices_oob,
     shuffle_pages=True,
 ):
+    """Build the KV inputs for the gfx1250 seg asm decode (qk_head_dim=576 =
+    nope 512 + rope 64).
+
+    Returns (kv_buffer, kv_buffer_ref, kv_indices):
+      kv_buffer     : fp8 (float8_e4m3fn), aiter PAGE-level seg-pack, shape
+                      [num_pages, page_size, 1, 576] holding
+                      [page_size*512 (nope) | page_size*64 (pe)] per page
+                      (page_size=64). This is what mla.mla_decode_fwd consumes.
+                      Built by _pack_rope_split2_kv_pages.
+      kv_buffer_ref : fp8 (float8_e4m3fn), TOKEN-major scattered cache
+                      [num_pages, page_size, 1, 576] (pages placed at their
+                      physical ids); consumed only by the PyTorch fp32 reference.
+      kv_indices    : int32 PAGE-level block table [batch*(npb+oob)] of physical
+                      page ids (compact, OOB padding appended after valid pages).
+    """
     device = torch.device("cuda")
     page_size = 64
     nhead_kv = 1
@@ -279,6 +294,15 @@ def _make_mla_mi400_kv_case(
 def _make_mla_mi400_q_case(
     *, q_fp8, batch, decode_qlen, nhead, qk_head_dim, v_head_dim
 ):
+    """Build the Q input for the gfx1250 seg asm decode.
+
+    Returns q: fp8 (float8_e4m3fn), shape [total_q, nhead, 576], NON-contiguous
+    768-padded selected layout -- per-head row stride = 768 elems (=768 B in
+    fp8), i.e. each head's 576 values ([nope 512][rope 64]) followed by 192 B of
+    zero padding (_MLA_Q_OUT_PADDED_DIM). Built by _pack_rope_split3_q_pages +
+    as_strided. (The PyTorch fp32 reference instead reads the unpadded q_fp8
+    directly.)
+    """
     q = q_fp8.view(batch, decode_qlen, nhead, qk_head_dim)
     q = _pack_rope_split3_q_pages(
         q,
