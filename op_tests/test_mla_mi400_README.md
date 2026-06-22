@@ -28,10 +28,14 @@
 
 ## 3. 命令行参数
 
+该脚本已精简为**只跑 gfx1250/mi400 fp8 decode sweep**（不再有 `--mi400`
+on/off/auto 开关，也不含 prefill / bf16 decode / gluon 等非 mi400 路径）。运行时
+driver 始终把 dtype/page/维度等覆盖成 mi400 fp8 decode 组合。
+
 | 参数 | 取值 | 说明 |
 |---|---|---|
-| `--mi400` | `auto`(默认 off) / `on` / `off` | 切换到 gfx1250/mi400 fp8 decode sweep。`auto` 在 `get_gfx()=="gfx1250"` 时自动开启；`on` 强制开启。 |
 | `--mi400-variant` | `_MI400_KERNEL_VARIANTS` 中的某个 `name` | **只测试指定的单个 kernel variant**；不传则测试全部 variant。 |
+| `--mask` | `0` / `1`（可多值，默认 `1`） | mi400 attention mask 选择：`0` 关闭 causal/tail mask，`1` 开启。 |
 
 可选 variant 名称（即 `_MI400_KERNEL_VARIANTS[*].name`）：
 
@@ -44,11 +48,12 @@
 | `qh64-q1-16mx4-64nx1-np` | (64, 1) |
 | `qh128-q1-16mx4-64nx1-np` | (128, 1) |
 
-`--mi400` 活动时，driver 会把 dtype/page/维度等覆盖成 mi400 fp8 decode 组合，
-并按下列源码常量做笛卡尔 sweep：
+driver 按下列源码常量做笛卡尔 sweep：
 
-- `_MI400_CTX_LENS`：KV 上下文长度列表。
-- `_MI400_BATCH_SIZES`：batch 大小列表。
+- `_MI400_CTX_LENS`：KV 上下文长度列表（当前为
+  `[7, 17, 33, 65, 256, 512, 1024, 4096, 10240]`）。
+- `_MI400_BATCH_SIZES`：batch 大小列表（当前为
+  `[1, 2, 4, 8, 16, 32, 64, 128, 256, 512]`）。
 - `_MI400_SPLIT_PER_BATCH`：每 batch 的 KV split 数；其中 **`None` 表示交由
   `mla_decode_fwd` 的 `get_meta_param` 自动选择**（见第 5 节）。
 
@@ -63,7 +68,7 @@ docker exec ff_mla bash -lc 'cd /home/carhuang/feifei/aiter && \
   ROCM_HOME=/opt/rocm ENABLE_CK=0 ENABLE_FLYDSL=0 \
   GPU_ARCHS=gfx1250 AITER_GPU_ARCHS=gfx1250 \
   AITER_ASM_DIR=/home/carhuang/feifei/aiter/hsa \
-  python3 op_tests/test_mla_mi400.py --mi400 on'
+  python3 op_tests/test_mla_mi400.py'
 ```
 
 ### 只测试单个 variant（推荐，速度快）
@@ -77,7 +82,7 @@ docker exec ff_mla bash -lc 'cd /home/carhuang/feifei/aiter && \
   ROCM_HOME=/opt/rocm ENABLE_CK=0 ENABLE_FLYDSL=0 \
   GPU_ARCHS=gfx1250 AITER_GPU_ARCHS=gfx1250 \
   AITER_ASM_DIR=/home/carhuang/feifei/aiter/hsa \
-  python3 op_tests/test_mla_mi400.py --mi400 on \
+  python3 op_tests/test_mla_mi400.py \
   --mi400-variant qh128-q1-16mx4-64nx1-np'
 ```
 
@@ -118,7 +123,7 @@ nhead, decode_qlen, dtypes.fp8)` 解析出**具体的 split 数**与 `num_kv_spl
 `mi400:us / mi400:TFLOPS / mi400:TB/s` 列即为性能报告。建议把日志重定向到文件再统计：
 
 ```bash
-... python3 op_tests/test_mla_mi400.py --mi400 on \
+... python3 op_tests/test_mla_mi400.py \
   --mi400-variant qh128-q1-16mx4-64nx1-np > /tmp/mla_qh128.log 2>&1
 grep -E "mla_decode-mi400|TFLOPS" /tmp/mla_qh128.log
 ```
