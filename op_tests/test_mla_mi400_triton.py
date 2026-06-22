@@ -81,8 +81,9 @@ _MI400_VARIANT_BY_KEY = {(v.nhead, v.decode_qlen): v for v in _MI400_KERNEL_VARI
 _MI400_VARIANT_BY_KEY_NAME = {v.name: v for v in _MI400_KERNEL_VARIANTS}
 
 _DEFAULT_NHEAD = [(16, 1), (32, 1), (64, 1), (128, 1), (16, 2), (16, 4)]
-_DEFAULT_CTX_LENS = [17, 65, 256, 1024, 4096]
-_DEFAULT_BATCH_SIZES = [1, 4, 16, 64]
+_MI400_CTX_LENS = [7, 17, 33, 65, 256, 512, 1024, 10240]
+_MI400_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+_MI400_SPLIT_PER_BATCH = [None]
 
 
 # --------------------------------------------------------------------------- #
@@ -166,7 +167,32 @@ def _build_case(
     """Build one logical fp8 Q/KV case and the per-kernel views/metadata.
 
     Returns a dict with everything both kernels need. Both kernels read the
-    EXACT same fp8 Q and KV values; only the memory layout differs.
+    EXACT same logical fp8 Q and KV values; only the dtype/memory layout differs.
+
+    Q / KV dtype + layout per kernel (qk_head_dim=576 = nope 512 + rope 64):
+
+      aiter (gfx1250 seg asm, mla.mla_decode_fwd):
+        q_seg : fp8 (float8_e4m3fn), shape [total_q, nhead, 576], NON-contiguous
+                768-padded selected layout: per-head row stride = 768 elems
+                (=768 B in fp8), i.e. each head's 576 values followed by 192 B
+                of zero padding (_MLA_Q_OUT_PADDED_DIM). Built by
+                _pack_rope_split3_q_pages + as_strided.
+        kv_seg: fp8 (float8_e4m3fn), page-level seg-pack, shape
+                [num_pages, page_size, 1, 576] holding
+                [page_size*512 (nope) | page_size*64 (pe)] per page
+                (page_size=64). Built by _pack_rope_split2_kv_pages.
+
+      triton (ATOM SGLang-style page_size=1, mla_decode.decode_attention_fwd):
+        q_tok : bf16 (ATOM casts q to bf16; kernel has no q dequant), shape
+                [total_q, nhead, 576], CONTIGUOUS (head row stride = 576).
+        k/v   : fp8 (float8_e4m3fn), token-major cache
+                [num_slots, 1, 1, 576] (= kv_cache.unsqueeze(2)); dequantized
+                in-kernel via k_scale/v_scale; v_buffer = k_buffer[..., :512].
+                page_size=1, token-level dense block_table.
+
+    Both q_seg (fp8) and q_tok (bf16) derive from the same q_fp8 values; both KV
+    views are views of the same physical fp8 KV. So cos_diff isolates the
+    kernel/layout, not quantization.
     """
     device = torch.device("cuda")
     nhead_kv = 1
@@ -228,22 +254,37 @@ def _build_case(
     num_kv_splits = int(num_kv_splits)
 
     # --- ATOM triton inputs (exactly as attention_mla.py builds them) --------- #
-    # ATOM: k_buffer = kv_cache.unsqueeze(2) -> token-major [num_pages, page_size,
-    # 1, 576] fp8; v_buffer = k_buffer[..., :kv_lora]; q cast to bf16; dense
-    # block_table [rows, npb] of physical page ids; per-row context_lens; the
-    # kernel pages internally via kv_loc = page*page_size + offset.
-    k_buffer_atom = kv_ref_fp8  # [total_pages, page_size, 1, 576] fp8, token-major
+    # ATOM's plain triton MLA decode is the "SGLang-style page_size=1" path
+    # (envs.ATOM_MLA_PAGE_SIZE default 1 -> AiterMLAMetadataBuilder.block_size=1):
+    #   - cache is token-major: kv_cache [num_slots, 1, 576].unsqueeze(2) ->
+    #     [num_slots, 1, 1, 576], so page_size = k_buffer.shape[1] = 1.
+    #   - block_table is TOKEN-level: csr_to_dense_block_table scatters the
+    #     token-level kv_indices into a dense [bs, max_seqlen_k] table whose
+    #     entries are physical token-slot ids (block_size==1 => slot ids are the
+    #     kv_indices directly).
+    #   - kernel pages via kv_loc = block_table[token]*1 + 0 = slot id.
+    # Mirror that exactly (NOT aiter's page_size=64 page-level layout), so
+    # triton_us faithfully reflects ATOM's production triton decode.
+    triton_page_size = 1
+    # token-major view of the SAME physical fp8 KV: token slot = phys_page*64 + off
+    k_buffer_atom = kv_ref_fp8.reshape(total_pages * page_size, 1, 1, qk_head_dim)
     v_buffer_atom = k_buffer_atom[..., :v_head_dim]
     q_tok = q_fp8.view(total_q, nhead, qk_head_dim).to(torch.bfloat16)
 
-    # dense block_table + per-row context_lens, one row per decode query token.
-    block_table = torch.zeros((total_q, npb), dtype=torch.int32, device=device)
+    # token-level dense block_table [total_q, ctx_lens]: entry = physical token
+    # slot id of that context token (phys_page*page_size + within-page offset),
+    # matching ATOM's token-level kv_indices. per-row context_lens encode causal.
+    tok_offsets = torch.arange(ctx_lens, dtype=torch.int32, device=device)
+    logical_page = tok_offsets // page_size
+    within_page = tok_offsets % page_size
+    block_table = torch.zeros((total_q, ctx_lens), dtype=torch.int32, device=device)
     context_lens = torch.empty(total_q, dtype=torch.int32, device=device)
     for b in range(batch):
-        pages_b = kv_indices[b * npb : (b + 1) * npb]  # physical page ids (shuffled)
+        pages_b = kv_indices[b * npb : (b + 1) * npb].to(torch.int32)  # phys pages
+        slots_b = pages_b[logical_page] * page_size + within_page  # [ctx] phys slots
         for qpos in range(decode_qlen):
             row = b * decode_qlen + qpos
-            block_table[row] = pages_b
+            block_table[row] = slots_b
             # causal: query token qpos sees ctx_lens - (decode_qlen-1-qpos) tokens
             context_lens[row] = (
                 ctx_lens - (decode_qlen - 1 - qpos) if mask else ctx_lens
@@ -273,6 +314,7 @@ def _build_case(
         "v_buffer_atom": v_buffer_atom,
         "block_table": block_table,
         "context_lens": context_lens,
+        "triton_page_size": triton_page_size,
     }
 
 
@@ -333,7 +375,7 @@ def _run_triton(case, nhead, triton_kv_splits, *, perf):
         attn_logits,
         triton_kv_splits,
         case["sm_scale"],
-        case["page_size"],
+        case["triton_page_size"],
     )
     fn_kwargs = dict(k_scale=one, v_scale=one)
     if perf:
@@ -488,7 +530,7 @@ def _build_parser():
         "--ctxLen",
         type=int,
         nargs="*",
-        default=_DEFAULT_CTX_LENS,
+        default=_MI400_CTX_LENS,
         help="context length(s). e.g.: -c 1024",
     )
     parser.add_argument(
@@ -496,7 +538,7 @@ def _build_parser():
         "--batchSize",
         type=int,
         nargs="*",
-        default=_DEFAULT_BATCH_SIZES,
+        default=_MI400_BATCH_SIZES,
         help="batch size(s). e.g.: -b 16",
     )
     parser.add_argument(
