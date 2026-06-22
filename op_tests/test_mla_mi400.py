@@ -338,6 +338,20 @@ def _ref_mla_mi400(
     v_head_dim,
     mask,
 ):
+    """PyTorch fp32 analytic reference (qk_head_dim=576 = nope 512 + rope 64).
+
+    Inputs it reads (both UNPACKED relative to the aiter kernel layouts; both
+    fp8 then upcast to fp32 here so the reference carries no extra quant error):
+      q_ref         : fp8 (float8_e4m3fn), CONTIGUOUS [total_q, nhead, 576]
+                      (the plain q_fp8, NOT the 768-padded selected layout the
+                      asm kernel consumes). Upcast via .float() * q_scale.
+      kv_buffer_ref : fp8 (float8_e4m3fn), TOKEN-major scattered cache
+                      [num_pages, page_size, 1, 576] (pages at physical ids, NOT
+                      the seg-packed layout). Gathered per batch by physical
+                      page id (kv_indices), upcast via .float() * kv_scale, then
+                      reshaped to [ctx_lens, 1, 576]; key=full 576, value=[:512].
+    Output: bf16 [total_q, nhead, 512] (softmax(QK^T/sqrt(576))·V, causal mask).
+    """
     outputs = []
     num_pages = case["num_pages_per_batch"]
     kv_source = kv_buffer_ref
