@@ -341,7 +341,7 @@ def _ref_mla_mi400(
     """PyTorch fp32 analytic reference (qk_head_dim=576 = nope 512 + rope 64).
 
     Inputs it reads (both UNPACKED relative to the aiter kernel layouts; both
-    fp8 then upcast to fp32 here so the reference carries no extra quant error):
+    fp8 then upcast to fp32 here so the r eference carries no extra quant error):
       q_ref         : fp8 (float8_e4m3fn), CONTIGUOUS [total_q, nhead, 576]
                       (the plain q_fp8, NOT the 768-padded selected layout the
                       asm kernel consumes). Upcast via .float() * q_scale.
