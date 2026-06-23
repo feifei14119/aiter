@@ -121,9 +121,18 @@ struct __attribute__((packed)) MlaMi400KernelArgs
     p2 _p16;
     void* ptr_KVROPE;
     p2 _p17;
+    // valid split count writeback: per-batch real valid KV split count the
+    // stage1 kernel reports, so the Python stage2 reducer can skip invalid
+    // (direct-exit) split partials. nullptr disables writeback.
+    void* ptr_VALID_SPLIT_COUNT;
+    p2 _p18;
+    // when set, invalid splits direct-exit (instead of writing empty output)
+    // and the kernel reports the real valid split count via ptr_VALID_SPLIT_COUNT.
+    unsigned int use_valid_split_count_reduce;
+    p3 _p19;
 };
 
-static_assert(sizeof(MlaMi400KernelArgs) == 288, "MLA mi400 packed args must be 18*16=288B");
+static_assert(sizeof(MlaMi400KernelArgs) == 320, "MLA mi400 packed args must be 20*16=320B");
 
 std::string get_heuristic_kernel_mla(std::string q_type,
                                      std::string kv_type,
@@ -264,6 +273,8 @@ static void mla_decode_mi400_dispatch(
     aiter_tensor_t* lse,
     aiter_tensor_t* q_scale,
     aiter_tensor_t* kv_scale,
+    aiter_tensor_t* valid_split_count,
+    int use_valid_split_count_reduce,
     hipStream_t stream)
 {
     (void)lse;
@@ -398,6 +409,10 @@ static void mla_decode_mi400_dispatch(
     args.out_16_nosplit     = (kv_split == 1) ? 1 : 0;
     args.ptr_QROPE          = q_scale->data_ptr();
     args.ptr_KVROPE         = kv_scale->data_ptr();
+    args.ptr_VALID_SPLIT_COUNT =
+        (valid_split_count != nullptr) ? valid_split_count->data_ptr() : nullptr;
+    args.use_valid_split_count_reduce =
+        static_cast<unsigned int>(use_valid_split_count_reduce);
 
     const int gdx = (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
     const int gdy = batch;
@@ -643,6 +658,8 @@ void mla_decode_stage1_asm_fwd(
     aiter_tensor_t* g_kv_indptr,          //   [batch_size+1] GLOBAL kv_indptr for round-robin CP (nullable)
     int cp_world_size,                    //   round-robin CP world size (1 == disabled)
     int cp_rank,                          //   round-robin CP rank id
+    aiter_tensor_t* valid_split_count,    //   [batch_size] per-batch valid KV split count writeback (nullable)
+    int use_valid_split_count_reduce,     //   1: invalid splits direct-exit + report valid split count; 0: legacy
     hipStream_t stream)
 {    
     int batch           = qo_indptr->size(0) - 1;
@@ -679,6 +696,8 @@ void mla_decode_stage1_asm_fwd(
                                          lse,
                                          q_scale,
                                          kv_scale,
+                                         valid_split_count,
+                                         use_valid_split_count_reduce,
                                          stream);
     }
 

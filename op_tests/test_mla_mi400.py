@@ -288,6 +288,19 @@ def _make_mla_mi400_kv_case(
             dtype=kv_buffer_source_bf16.dtype,
             device=kv_buffer_source_bf16.device,
         )
+    # Poison the unused tail of every batch's last (partially filled) page with
+    # NaN. When ctx_lens % page_size != 0 the final logical page of each batch
+    # keeps only last_page_len valid tokens; slots [last_page_len:page_size] are
+    # never valid KV. The kernel must honor kv_last_page_lens / kv_indptr and
+    # never read past them, so a correct kernel still yields a finite, matching
+    # output. The PyTorch reference excludes this tail via kv[:ctx_lens].
+    last_page_len = ctx_lens % page_size or page_size
+    if last_page_len != page_size:
+        last_logical_pages = [
+            (b + 1) * num_pages_per_batch - 1 for b in range(batch)
+        ]
+        kv_buffer_logical_bf16[last_logical_pages, last_page_len:] = float("nan")
+
     # The kernel consumes a compact block table, with OOB padding only after all
     # valid pages. KV pages are scattered into their physical page ids.
     shuffled_page_indices = _make_page_permutation(total_pages, shuffle=shuffle_pages)
