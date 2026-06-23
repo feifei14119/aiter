@@ -824,6 +824,13 @@ def mla_decode_stage1_asm_fwd(
     g_kv_indptr: Optional[torch.Tensor] = None,
     cp_world_size: int = 1,
     cp_rank: int = 0,
+    # [batch_size] per-batch valid KV split count writeback (nullable). The
+    # stage1 kernel stores the real valid split count so stage2 can skip
+    # invalid (direct-exit) split partials.
+    valid_split_count: Optional[torch.Tensor] = None,
+    # 1: invalid splits direct-exit and the kernel reports valid_split_count;
+    # 0: legacy empty-output path.
+    use_valid_split_count_reduce: int = 0,
 ) -> None: ...
 
 
