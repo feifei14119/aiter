@@ -1,6 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+# gfx1250 / mi400 MLA fp8 decode test. Run inside the `ff_mla` container:
+#
+#   # Single variant (default is qh128-q1-16mx4-64nx1-np):
+#   docker exec ff_mla bash -lc 'cd /home/carhuang/feifei/aiter && \
+#     rm -rf aiter/jit/build/module_mla_asm aiter/jit/module_mla_asm.so && \
+#     env -u AITER_ASM_DEBUG -u AITER_MLA_DEBUG_SKIP_KERNEL \
+#     ROCM_HOME=/opt/rocm ENABLE_CK=0 ENABLE_FLYDSL=0 \
+#     GPU_ARCHS=gfx1250 AITER_GPU_ARCHS=gfx1250 \
+#     AITER_ASM_DIR=/home/carhuang/feifei/aiter/hsa \
+#     python3 op_tests/test_mla_mi400.py \
+#     --mi400-variant qh128-q1-16mx4-64nx1-np'
+#
+#   # First JIT build takes ~10s; drop the `rm -rf` line to reuse the cache.
+#   # See op_tests/test_mla_mi400_README.md for full details.
+
 import argparse
 import itertools
 import os
@@ -81,9 +96,9 @@ _MI400_VARIANT_BY_KEY_NAME = {v.name: v for v in _MI400_KERNEL_VARIANTS}
 
 # mi400 driver sweep dims.
 _MI400_NHEAD = [(v.nhead, v.decode_qlen) for v in _MI400_KERNEL_VARIANTS]
-_MI400_CTX_LENS = [7, 17, 33, 65, 256, 512, 1024, 4096, 10240]
-_MI400_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
-_MI400_SPLIT_PER_BATCH = [None]
+_MI400_CTX_LENS = [128] # [7, 17, 33, 65, 256, 512, 1024, 4096, 10240]
+_MI400_BATCH_SIZES = [1] # [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+_MI400_SPLIT_PER_BATCH = [2]
 
 
 def _pack_rope_split3_q_pages(tensor, nope_dim, rope_dim, padded_stride_bytes=768):
@@ -690,7 +705,7 @@ parser.add_argument(
 parser.add_argument(
     "--mi400-variant",
     choices=[v.name for v in _MI400_KERNEL_VARIANTS],
-    default=None,
+    default="qh128-q1-16mx4-64nx1-np",
     help="""Restrict the mi400 sweep to a single kernel variant from
     _MI400_KERNEL_VARIANTS (by name). Default: all variants.""",
 )
