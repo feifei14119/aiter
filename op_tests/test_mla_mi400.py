@@ -98,7 +98,7 @@ _MI400_VARIANT_BY_KEY_NAME = {v.name: v for v in _MI400_KERNEL_VARIANTS}
 _MI400_NHEAD = [(v.nhead, v.decode_qlen) for v in _MI400_KERNEL_VARIANTS]
 _MI400_CTX_LENS = [128] # [7, 17, 33, 65, 256, 512, 1024, 4096, 10240]
 _MI400_BATCH_SIZES = [1] # [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
-_MI400_SPLIT_PER_BATCH = [2]
+_MI400_SPLIT_PER_BATCH = [1]
 
 
 def _pack_rope_split3_q_pages(tensor, nope_dim, rope_dim, padded_stride_bytes=768):
