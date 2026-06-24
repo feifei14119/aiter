@@ -32,6 +32,9 @@ Run inside the gfx1250 aiter container (see mla_atom_dump_howto.md):
       python3 test_mla_atom_dump.py --from-dump /data/mla_dump'
 """
 
+
+# python aiter/op_tests/test_mla_atom_dump.py --from-dump /data/mla_dump --pass triton
+
 import argparse
 import glob
 import json
@@ -125,14 +128,31 @@ def _cosine_diff(actual, expected):
 
 
 # --------------------------------------------------------------------------- #
+# ATOM's real triton kernel (the one that PRODUCED the dump). Lazily imported so
+# the test still runs in aiter-only containers when --pass=aiter.
+# --------------------------------------------------------------------------- #
+def _atom_triton_decode():
+    # ATOM's triton kernel, VENDORED into this test dir (_atom_v4_paged_decode_triton.py)
+    # so the triton pass runs fully standalone — no `import atom`. It is the same
+    # kernel that produced the dump (ATOM_USE_TRITON_ATTN=1). Deps: torch/triton/aiter.
+    from _atom_v4_paged_decode_triton import sparse_attn_v4_paged_decode
+
+    return sparse_attn_v4_paged_decode
+
+
+# --------------------------------------------------------------------------- #
 # Feature 1 — tensor replay (use ATOM's dumped inputs + golden output)
 # --------------------------------------------------------------------------- #
-def run_from_dump(dump_dir, cos_threshold):
+def run_from_dump(dump_dir, cos_threshold, which_pass="aiter"):
     files = sorted(glob.glob(os.path.join(dump_dir, "mla_decode.rank*.*.pt")))
     if not files:
         raise FileNotFoundError(
             f"no mla_decode.rank*.*.pt tensor dumps under {dump_dir}"
         )
+    run_aiter = which_pass in ("aiter", "both")
+    run_triton = which_pass in ("triton", "both")
+    atom_triton = _atom_triton_decode() if run_triton else None
+
     device = torch.device("cuda")
     rows = []
     failures = []
@@ -150,61 +170,68 @@ def run_from_dump(dump_dir, cos_threshold):
         softmax_scale = float(p["softmax_scale"])
         has_invalid = bool(p.get("has_invalid", False))
 
-        out_aiter = pa_decode_sparse(
-            q,
-            unified_kv,
-            kv_indices,
-            kv_indptr,
-            attn_sink,
-            softmax_scale,
-            kv_scales=kv_scales,
-            has_invalid=has_invalid,
-        )
+        row = {
+            "src": os.path.basename(f),
+            "layer": p.get("layer_id"),
+            "ratio": p.get("ratio"),
+            "T": p["T"],
+            "H": p["H"],
+            "D": p["D"],
+            "max_kv": p.get("max_kv_len"),
+            "fp8": kv_scales is not None,
+        }
+        passed = True
 
-        # Independent torch golden on the SAME inputs (dequant fp8 KV first).
-        ukv_ref = (
-            _dequant_kv_fp8(unified_kv, kv_scales).to(q.dtype)
-            if kv_scales is not None
-            else unified_kv
-        )
-        ref = _reference(q, ukv_ref, kv_indices, kv_indptr, attn_sink, softmax_scale)
+        # --- triton pass: re-run ATOM's real triton kernel on the dumped ----- #
+        # inputs and check it reproduces the dumped output (dump fidelity /
+        # determinism). Same kernel + same inputs => cos ~ 0.
+        if run_triton:
+            out_triton = atom_triton(
+                q,
+                unified_kv,
+                kv_indices,
+                kv_indptr,
+                attn_sink,
+                softmax_scale,
+                kv_scales=kv_scales,
+            )
+            cos_triton_atom = _cosine_diff(out_triton, o_atom.view_as(out_triton))
+            row["cos(triton,atom)"] = cos_triton_atom
+            passed = passed and cos_triton_atom < cos_threshold
 
-        cos_aiter_atom = _cosine_diff(out_aiter, o_atom.view_as(out_aiter))
-        cos_aiter_ref = _cosine_diff(out_aiter, ref)
-        cos_atom_ref = _cosine_diff(o_atom.view_as(ref), ref)
-        passed = cos_aiter_atom < cos_threshold
-        rows.append(
-            {
-                "src": os.path.basename(f),
-                "layer": p.get("layer_id"),
-                "ratio": p.get("ratio"),
-                "T": p["T"],
-                "H": p["H"],
-                "D": p["D"],
-                "max_kv": p.get("max_kv_len"),
-                "fp8": kv_scales is not None,
-                "cos(aiter,atom)": cos_aiter_atom,
-                "cos(aiter,ref)": cos_aiter_ref,
-                "cos(atom,ref)": cos_atom_ref,
-                "passed": passed,
-            }
-        )
+        # --- aiter pass: run the aiter op on the SAME inputs ----------------- #
+        if run_aiter:
+            out_aiter = pa_decode_sparse(
+                q,
+                unified_kv,
+                kv_indices,
+                kv_indptr,
+                attn_sink,
+                softmax_scale,
+                kv_scales=kv_scales,
+                has_invalid=has_invalid,
+            )
+            cos_aiter_atom = _cosine_diff(out_aiter, o_atom.view_as(out_aiter))
+            row["cos(aiter,atom)"] = cos_aiter_atom
+            passed = passed and cos_aiter_atom < cos_threshold
+
+        row["passed"] = passed
+        rows.append(row)
         aiter.logger.info(
-            "dump [%s | L%s r%s T=%d H=%d ctx=%d]: cos(aiter,atom)=%.3e "
-            "cos(aiter,ref)=%.3e cos(atom,ref)=%.3e %s",
+            "dump [%s | L%s r%s T=%d H=%d ctx=%d]: %s %s",
             os.path.basename(f),
             p.get("layer_id"),
             p.get("ratio"),
             p["T"],
             p["H"],
             p.get("max_kv_len"),
-            cos_aiter_atom,
-            cos_aiter_ref,
-            cos_atom_ref,
+            " ".join(
+                f"{k}={row[k]:.3e}" for k in row if k.startswith("cos(")
+            ),
             "passed" if passed else "FAILED",
         )
         if not passed:
-            failures.append((os.path.basename(f), cos_aiter_atom))
+            failures.append((os.path.basename(f), {k: row[k] for k in row if k.startswith("cos(")}))
     return rows, failures
 
 
@@ -327,6 +354,16 @@ def _build_parser():
         action="store_true",
         help="(params mode) run every manifest line, not just distinct shapes.",
     )
+    parser.add_argument(
+        "--pass",
+        dest="which_pass",
+        choices=["aiter", "triton", "both"],
+        default="aiter",
+        help="(dump mode) which kernel to run on the dumped inputs:\n"
+        "  aiter  - aiter pa_decode_sparse vs dumped output (default)\n"
+        "  triton - ATOM's real triton kernel vs dumped output (dump fidelity)\n"
+        "  both   - run both passes.",
+    )
     return parser
 
 
@@ -338,8 +375,10 @@ def main():
         )
         label = "params"
     else:
-        rows, failures = run_from_dump(args.from_dump, args.cos_threshold)
-        label = "dump"
+        rows, failures = run_from_dump(
+            args.from_dump, args.cos_threshold, which_pass=args.which_pass
+        )
+        label = f"dump/{args.which_pass}"
 
     if rows:
         aiter.logger.info(
