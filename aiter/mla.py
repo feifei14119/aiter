@@ -4,6 +4,7 @@
 # user interface
 
 import functools
+import os
 from typing import Optional
 import torch
 import triton
@@ -283,31 +284,69 @@ def mla_decode_fwd(
             else None
         )
 
-        aiter.mla_decode_stage1_asm_fwd(
-            q,
-            kv_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            num_kv_splits_indptr,
-            None,
-            None,
-            None,
-            max_seqlen_q,
-            page_size,
-            nhead_kv,
-            sm_scale,
-            logits,
-            attn_lse,
-            o,
-            final_lse,
-            q_scale,
-            kv_scale,
-            g_kv_indptr,
-            cp_world_size,
-            cp_rank,
+        # Opt-in Python loader backend (AITER_MLA_PY_LOADER=1): load + launch the
+        # gfx1250 stage1 asm .co directly from Python instead of the C++ op.
+        # Currently only wired for the verified qh128-q1 fp8 kernel; every other
+        # config falls through to the C++ dispatch below.
+        _use_py_loader = (
+            os.environ.get("AITER_MLA_PY_LOADER", "0") == "1"
+            and get_gfx() == "gfx1250"
+            and nhead_kv == 1
+            and nhead == 128
+            and max_seqlen_q == 1
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and q_scale is not None
+            and kv_scale is not None
+            and g_kv_indptr is None
         )
+        if _use_py_loader:
+            from aiter.mla_asm_py_loader import mla_decode_stage1_asm_fwd_py
+
+            mla_decode_stage1_asm_fwd_py(
+                q,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_lens,
+                num_kv_splits_indptr,
+                max_seqlen_q,
+                page_size,
+                nhead_kv,
+                sm_scale,
+                logits,
+                attn_lse,
+                o,
+                q_scale,
+                kv_scale,
+            )
+        else:
+            aiter.mla_decode_stage1_asm_fwd(
+                q,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_lens,
+                num_kv_splits_indptr,
+                None,
+                None,
+                None,
+                max_seqlen_q,
+                page_size,
+                nhead_kv,
+                sm_scale,
+                logits,
+                attn_lse,
+                o,
+                final_lse,
+                q_scale,
+                kv_scale,
+                g_kv_indptr,
+                cp_world_size,
+                cp_rank,
+            )
 
         if num_kv_splits == 1 and (
             q.dtype == dtypes.fp8
