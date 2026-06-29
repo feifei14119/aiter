@@ -1302,6 +1302,17 @@ def mla_decode_fwd_v4_nm(
     # we still pass *something* through to satisfy the C ABI.
     sm_scale_arg = 0.0 if sm_scale is None else float(sm_scale)
 
+    # Per-batch valid KV split count writeback buffer. Always allocated (and
+    # passed to the asm kernel) so it has a valid destination; whether stage2
+    # actually uses it is gated by use_valid_split_count_reduce. Initialized to
+    # num_kv_splits so a min() against it is a no-op until the kernel
+    # overwrites it with the real (smaller) valid count. Mirrors the V3
+    # mla_decode_fwd path (see the stage1 call above).
+    valid_split_count = torch.full(
+        (num_seqs,), num_kv_splits, dtype=dtypes.i32, device=q.device
+    )
+    use_valid_split_count_reduce = int(num_kv_splits > 1)
+
     aiter.mla_decode_v4_asm(
         q,
         qrope,
@@ -1320,6 +1331,8 @@ def mla_decode_fwd_v4_nm(
         logits,
         attn_lse,
         output,
+        valid_split_count,
+        use_valid_split_count_reduce,
     )
 
     # ---- Cross-split FlashAttention merge via _fwd_kernel_stage2_asm ------
@@ -1351,6 +1364,7 @@ def mla_decode_fwd_v4_nm(
             kv_indptr,
             kv_last_page_lens,
             split_indptr,  # num_kv_splits_indptr
+            valid_split_count,  # [num_seqs] i32; written by the asm kernel
             attn_lse.stride(0),  # stride_mid_ob = num_kv_splits * num_heads
             attn_lse.stride(2),  # stride_mid_oh = 1
             attn_lse.stride(1),  # stride_mid_os = num_heads
@@ -1361,6 +1375,7 @@ def mla_decode_fwd_v4_nm(
             KV_INDPTR_IS_PAGE_LEVEL=False,  # page_size=1 -> token-level indptr
             MAYBE_FINAL_OUT=True,
             HAS_FINAL_LSE=False,
+            USE_VALID_SPLIT_COUNT_REDUCE=use_valid_split_count_reduce,
             BATCH_NUM=num_seqs,
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
