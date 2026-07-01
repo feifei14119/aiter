@@ -72,11 +72,13 @@ class Mlagfx1250KernelVariant:
 
 
 _gfx1250_KERNEL_VARIANTS = [
-    #Mlagfx1250KernelVariant(name="qh16-q4-16mx4-64nx1-np", nhead=16, decode_qlen=4),
+    Mlagfx1250KernelVariant(name="qh16-q4-16mx4-64nx1-np", nhead=16, decode_qlen=4),
     Mlagfx1250KernelVariant(name="qh64-q1-16mx4-64nx1-np", nhead=64, decode_qlen=1),
-    #Mlagfx1250KernelVariant(name="qh128-q1-16mx4-64nx1-np", nhead=128, decode_qlen=1),
+    Mlagfx1250KernelVariant(name="qh128-q1-16mx4-64nx1-np", nhead=128, decode_qlen=1),
 ]
-_gfx1250_VARIANT_BY_KEY = {(v.nhead, v.decode_qlen): v for v in _gfx1250_KERNEL_VARIANTS}
+_gfx1250_VARIANT_BY_KEY = {
+    (v.nhead, v.decode_qlen): v for v in _gfx1250_KERNEL_VARIANTS
+}
 _gfx1250_VARIANT_BY_KEY_NAME = {v.name: v for v in _gfx1250_KERNEL_VARIANTS}
 
 # Default sweep grids (mirrors test_mla_gfx1250_triton.py).
