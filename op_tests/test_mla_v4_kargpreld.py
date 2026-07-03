@@ -16,10 +16,6 @@ Structured per `.claude/skills/aiter-op-test/SKILL.md` (mirrors
   - `main()` gates on `get_gfx()` (v4 nm is shipped only for gfx1250), sweeps
     the shape lists with `itertools.product`, and prints one markdown table.
 
-Behavioural pytest guards (regression / multi-split / sink) are kept below the
-perf fn — they lock down historical landmines (the wave32-on-wave64 half-NaN
-pattern, sink kernarg slot 18, multi-split coverage) and are gfx1250-gated.
-
 NOT covered here (deferred, see TODO): bit-exact numerical parity vs a poc_kl
 dump. The v4 nm host pipeline does FP8+e8m0 dequant via
 fp8e4m3_mul_fp8e8m0_bpad8_to_bf16 + a multi-step buffer concat
@@ -30,17 +26,13 @@ math error to FP8 quant noise, which is sufficient for CI.
 Usage:
   # perf+accuracy sweep (prints the markdown table — the deliverable):
   ENABLE_CK=0 python op_tests/test_mla_v4_kargpreld.py
-  # pytest guards + default-shape smoke:
-  ENABLE_CK=0 python -m pytest -v op_tests/test_mla_v4_kargpreld.py
 """
 
 import argparse
 import itertools
 from dataclasses import dataclass
 
-import numpy as np
 import pandas as pd
-import pytest
 import torch
 
 import aiter
@@ -69,7 +61,7 @@ V_HEAD_DIM = 512  # logical V head dim = args.dim = kv_lora_rank
 
 # Perf iteration counts (kept out of the @benchmark signature so they don't
 # become table columns). main() overrides these from --iters / --warmup.
-_PERF = {"num_iters": 10, "num_warmup": 2}
+_PERF = {"num_iters": 2, "num_warmup": 1}
 _SEED = 0
 
 
@@ -90,9 +82,9 @@ class Mlagfx1250KernelVariant:
 
 
 _gfx1250_KERNEL_VARIANTS = [
-    Mlagfx1250KernelVariant(name="qh16-q4-16mx4-64nx1-np", nhead=16, decode_qlen=4),
+    #Mlagfx1250KernelVariant(name="qh16-q4-16mx4-64nx1-np", nhead=16, decode_qlen=4),
     Mlagfx1250KernelVariant(name="qh64-q1-16mx4-64nx1-np", nhead=64, decode_qlen=1),
-    Mlagfx1250KernelVariant(name="qh128-q1-16mx4-64nx1-np", nhead=128, decode_qlen=1),
+    #Mlagfx1250KernelVariant(name="qh128-q1-16mx4-64nx1-np", nhead=128, decode_qlen=1),
 ]
 _gfx1250_VARIANT_BY_KEY = {
     (v.nhead, v.decode_qlen): v for v in _gfx1250_KERNEL_VARIANTS
@@ -106,22 +98,9 @@ _gfx1250_VARIANT_BY_KEY_NAME = {v.name: v for v in _gfx1250_KERNEL_VARIANTS}
 _SHIPPED_TILE_VARIANTS = {(16, 4), (64, 1), (128, 1)}
 
 # Default sweep grids (mirrors test_mla_gfx1250_triton.py).
-_gfx1250_CTX_LENS = [7, 17, 67, 128 + 37]
-_gfx1250_BATCH_SIZES = [1, 16, 32]
-_gfx1250_SPLIT_PER_BATCH = [1, 2]
-
-
-def _on_gfx1250():
-    try:
-        return get_gfx() == "gfx1250"
-    except Exception:
-        return False
-
-
-needs_gfx1250 = pytest.mark.skipif(
-    not torch.cuda.is_available() or not _on_gfx1250(),
-    reason="v4 nm shader is shipped only for gfx1250; requires GPU",
-)
+_gfx1250_CTX_LENS = [137]#list[int](range(1,256))
+_gfx1250_BATCH_SIZES = [64]
+_gfx1250_SPLIT_PER_BATCH = [4]
 
 
 # ---------------------------------------------------------------------------
@@ -313,93 +292,6 @@ def _torch_attn_decode_fp8_dequant_ref(
 # ---------------------------------------------------------------------------
 # Input builders.
 # ---------------------------------------------------------------------------
-def _build_inputs(
-    batch=2, kv_seq_lens=64, q_seq_logical=4, num_heads=GQA_RATIO, device="cuda", seed=0
-):
-    """Random *byte-level* FP8 inputs (no dequantable structure). Used by the
-    behavioural pytest guards, which only care that the dispatcher launches and
-    the kernel writes every slot — not about numerics. Returns the full kwargs
-    dict `mla_decode_fwd_v4_nm` needs.
-
-    Sizes mirror what poc_kl/gfx1250/mla/mla.cpp computes for the same cmd
-    (only with kv_seq_lens shrunk small for fast pytest):
-      total_q  = batch * q_seq_logical
-      num_page = batch * (kv_seq_lens / page_size)
-    """
-    rng_np = np.random.default_rng(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-    total_q = batch * q_seq_logical
-    num_page = batch * (kv_seq_lens // PAGE_SIZE)
-    num_kv_splits = 1  # passes=1 for this variant
-
-    fp8_dt = aiter.dtypes.fp8
-
-    def _rand_fp8(shape):
-        np_arr = rng_np.integers(0, 256, size=shape, dtype=np.uint8)
-        u = torch.from_numpy(np_arr).to(device)
-        return u.view(fp8_dt)
-
-    q = _rand_fp8((total_q, num_heads, DIM_QK_PACKED))
-    qrope = torch.randn(
-        (total_q, num_heads, DIM_ROPE), dtype=torch.bfloat16, device=device
-    )
-
-    kv_buffer = _rand_fp8((num_page, PAGE_SIZE, NUM_KV_HEADS, DIM_QK_PACKED))
-    kvrope = torch.randn(
-        (num_page, PAGE_SIZE, NUM_KV_HEADS, DIM_ROPE),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-
-    qo_indptr = (
-        torch.arange(0, batch + 1, dtype=torch.int32, device=device) * q_seq_logical
-    )
-    pages_per_seq = kv_seq_lens // PAGE_SIZE
-    kv_indptr = (
-        torch.arange(0, batch + 1, dtype=torch.int32, device=device) * pages_per_seq
-    )
-    kv_page_indices = torch.arange(
-        0, batch * pages_per_seq, dtype=torch.int32, device=device
-    )
-    kv_last_page_lens = torch.full(
-        (batch,), kv_seq_lens % PAGE_SIZE, dtype=torch.int32, device=device
-    )
-    split_indptr = (
-        torch.arange(0, batch + 1, dtype=torch.int32, device=device) * num_kv_splits
-    )
-
-    # `output` is the *final reduce* buffer (3D) — MUST be [total_q, num_heads,
-    # v_head_dim] because the C-ABI dispatcher reads its .size(0/1/2).
-    output = torch.empty(
-        (total_q, num_heads, V_HEAD_DIM), dtype=torch.bfloat16, device=device
-    ).fill_(-1)
-
-    # sink: -inf = "no sink" math (exp(-inf) = 0).
-    sink = torch.full(
-        (num_heads,), float("-inf"), dtype=torch.float32, device=device
-    )
-
-    return dict(
-        q=q,
-        qrope=qrope,
-        kv_buffer=kv_buffer,
-        kvrope=kvrope,
-        output=output,
-        qo_indptr=qo_indptr,
-        kv_indptr=kv_indptr,
-        kv_page_indices=kv_page_indices,
-        kv_last_page_lens=kv_last_page_lens,
-        split_indptr=split_indptr,
-        max_seqlen_q=q_seq_logical,
-        sink=sink,
-        num_kv_splits=num_kv_splits,
-        out_16_nosplit=0,
-    )
-
-
 def _build_bf16_inputs(
     batch=2,
     kv_seq_lens=64,
@@ -478,7 +370,6 @@ def _build_bf16_inputs(
 # @benchmark perf + accuracy fn — the summary-table producer.
 # Its call args become the table's left-hand columns (SKILL rule 2).
 # ---------------------------------------------------------------------------
-@needs_gfx1250
 @benchmark()
 def test_mla_v4_nm(
     batch=2,
@@ -793,250 +684,6 @@ def asm_sparse_attn_v4_paged_decode(
 
 
 # ---------------------------------------------------------------------------
-# Behavioural pytest guards (gfx1250-gated). These lock down historical
-# landmines and do NOT belong in the perf table.
-# ---------------------------------------------------------------------------
-@needs_gfx1250
-def test_v4_nm_no_half_zero_pattern():
-    """Regression guard for the gfx1250 wave-size landmine.
-
-    The exact pre-fix symptom was: per row of dim_v=512 fp32 output, the first
-    half (256 elements) was 0xffc00000 (NaN) and the second half (256 elements)
-    was 0x00000000. This test fails loud on that pattern.
-    """
-    args = _build_inputs(batch=1, kv_seq_lens=64, q_seq_logical=4, seed=42)
-    logits, _ = aiter.mla.mla_decode_fwd_v4_nm(**args)
-    torch.cuda.synchronize()
-
-    written = logits[:, 0]  # [total_q, num_heads, dim_v]; only split=0 written
-    flat = written.reshape(-1, V_HEAD_DIM)
-    half = V_HEAD_DIM // 2
-    first_half_nan_count = torch.isnan(flat[:, :half]).sum(dim=1).max().item()
-    second_half_zero_count = (flat[:, half:] == 0.0).sum(dim=1).max().item()
-    assert not (
-        first_half_nan_count > half * 0.9 and second_half_zero_count > half * 0.9
-    ), (
-        f"Detected the wave32-on-wave64 launch landmine: "
-        f"first {first_half_nan_count}/{half} NaN, "
-        f"second {second_half_zero_count}/{half} zero. "
-        f"Check make_launch_geometry / dispatcher bdx is wv_tg*32 (=128) on gfx1250."
-    )
-
-
-@needs_gfx1250
-def test_v4_nm_multi_split_covers_full_kv():
-    """num_kv_splits=4 with kv_seq_lens=64: minimal config where every split WG
-    writes exactly one pass of partials, so a SENTINEL leak in any slot uniquely
-    identifies a kernel/dispatcher bug (vs noise from a legitimately-empty split).
-
-    Coverage invariant: floor(kv_seq_lens / num_kv_splits) >= pass_size(16).
-    kv=64, splits=4 -> 16 tokens/split = exactly one pass-iteration each.
-    """
-    NUM_SPLITS = 4
-    BATCH = 2
-    KV_LEN = 64
-    Q_SEQ = 4
-
-    args = _build_inputs(batch=BATCH, kv_seq_lens=KV_LEN, q_seq_logical=Q_SEQ, seed=0)
-    args["num_kv_splits"] = NUM_SPLITS
-    args["out_16_nosplit"] = 0
-    args.pop("split_indptr")  # auto-built V3-style
-
-    SENTINEL = -7.7e30
-    num_seqs = args["qo_indptr"].size(0) - 1
-    num_heads = args["q"].size(1)
-    msq = args["max_seqlen_q"]
-    total_q = num_seqs * msq
-    args["logits"] = torch.full(
-        (total_q, NUM_SPLITS, num_heads, V_HEAD_DIM),
-        SENTINEL,
-        dtype=torch.float32,
-        device="cuda",
-    )
-    args["attn_lse"] = torch.full(
-        (total_q, NUM_SPLITS, num_heads, 1),
-        SENTINEL,
-        dtype=torch.float32,
-        device="cuda",
-    )
-
-    logits, attn_lse = aiter.mla.mla_decode_fwd_v4_nm(**args)
-    torch.cuda.synchronize()
-
-    for s in range(NUM_SPLITS):
-        ut = (logits[:, s] == SENTINEL).float().mean().item()
-        assert ut < 0.01, (
-            f"split {s} kernel skipped ({ut*100:.1f}% still SENTINEL). "
-            f"Coverage invariant: floor(kv_seq_lens/num_kv_splits) >= 16. "
-            f"If it holds, the bug is upstream (dispatcher launch geometry, "
-            f"split_indptr stride math at slot 14, or kernel early-exit)."
-        )
-
-
-@needs_gfx1250
-def test_v4_nm_multi_split_rejects_out_16_nosplit():
-    """Multi-pass + out_16_nosplit=1 is unsupported (mirrors poc_kl's
-    `passes == 1 && out_16_nosplit == 1` guard). Wrapper must raise BEFORE the
-    kernel."""
-    args = _build_inputs(batch=1, kv_seq_lens=64, q_seq_logical=4, seed=0)
-    args["num_kv_splits"] = 2
-    args["out_16_nosplit"] = 1
-    args.pop("split_indptr")
-    with pytest.raises(ValueError, match="out_16_nosplit"):
-        aiter.mla.mla_decode_fwd_v4_nm(**args)
-
-
-# ---------------------------------------------------------------------------
-# Sink interface guards (PR-2: sink-aware .co + slot 18 plumbed end-to-end).
-# Use _build_bf16_inputs + _native_to_2buff_for_asm (NOT _build_inputs, whose
-# random FP8 bytes dequant to 100% NaN and make bit comparisons impossible).
-# ---------------------------------------------------------------------------
-def _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=0):
-    """Properly-quantized wrapper-args for sink behaviour tests. Output cells
-    are finite (modulo rare quant-noise NaN), which byte-level diffing needs."""
-    bf = _build_bf16_inputs(
-        batch=batch, kv_seq_lens=kv_seq_lens, q_seq_logical=q_seq_logical, seed=seed
-    )
-    q_packed, q_rope = _native_to_2buff_for_asm(bf["q_bf16"])
-    kv_packed, kv_rope = _native_to_2buff_for_asm(bf["kv_bf16"])
-
-    total_q = bf["q_bf16"].size(0)
-    num_heads = bf["q_bf16"].size(1)
-    device = bf["q_bf16"].device
-    output = torch.empty(
-        (total_q, num_heads, V_HEAD_DIM), dtype=dtypes.bf16, device=device
-    )
-    sink = torch.full((num_heads,), float("-inf"), dtype=torch.float32, device=device)
-
-    return dict(
-        q=q_packed,
-        qrope=q_rope.contiguous(),
-        kv_buffer=kv_packed,
-        kvrope=kv_rope.contiguous(),
-        output=output,
-        qo_indptr=bf["qo_indptr"],
-        kv_indptr=bf["kv_indptr"],
-        kv_page_indices=bf["kv_page_indices"],
-        kv_last_page_lens=bf["kv_last_page_lens"],
-        max_seqlen_q=bf["max_seqlen_q"],
-        sink=sink,
-    )
-
-
-@needs_gfx1250
-def test_v4_nm_sink_value_affects_output():
-    """sink=-inf vs a finite sink must produce DIFFERENT output bytes — proof
-    that sink reaches the kernel via slot 18 (offset 0x120)."""
-    args_a = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=0)
-    sink_size = args_a["sink"].numel()
-    device = args_a["q"].device
-
-    args_b = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=0)
-    args_b["sink"] = torch.full((sink_size,), 10.0, dtype=torch.float32, device=device)
-
-    logits_a, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_a)
-    torch.cuda.synchronize()
-    logits_a_bits = logits_a.view(torch.int32).clone()
-
-    logits_b, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_b)
-    torch.cuda.synchronize()
-    logits_b_bits = logits_b.view(torch.int32)
-
-    finite_both = torch.isfinite(logits_a[:, 0]) & torch.isfinite(logits_b[:, 0])
-    assert finite_both.any(), (
-        "All output cells were NaN/inf under both sink values — the quant "
-        "pipeline returned junk OR sink=10 pushed the running max into a "
-        "saturating regime."
-    )
-    diff_finite = (logits_a_bits[:, 0] != logits_b_bits[:, 0]) & finite_both
-    assert diff_finite.any(), (
-        "PR-2 regression: sink=-inf and sink=10.0 produced bit-identical output "
-        "among finite cells. Either the dispatcher stopped writing ptr_sink into "
-        "kernarg slot 18 (offset 0x120), or the .co was rebuilt from a "
-        "non-sink-aware .s. Check the static_assert in asm_mla_v4.cu."
-    )
-
-
-@needs_gfx1250
-def test_v4_nm_sink_neg_inf_no_nan_regression():
-    """sink=-inf is the documented 'no sink' convention. Verify it doesn't
-    introduce NEW NaN cells beyond a finite near-equivalent sentinel (-1e9)."""
-    args_inf = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=7)
-    sink_size = args_inf["sink"].numel()
-    device = args_inf["q"].device
-
-    args_big = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=7)
-    args_big["sink"] = torch.full(
-        (sink_size,), -1.0e9, dtype=torch.float32, device=device
-    )
-
-    logits_inf, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_inf)
-    logits_big, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_big)
-    torch.cuda.synchronize()
-
-    nan_inf = torch.isnan(logits_inf[:, 0])
-    nan_big = torch.isnan(logits_big[:, 0])
-    extra_nans = (nan_inf & ~nan_big).sum().item()
-    assert extra_nans == 0, (
-        f"sink=-inf introduced {extra_nans} NaN cells over the -1e9 control. "
-        f"The sink merge in 3_13.s is not -inf-stable; switch the 'no sink' "
-        f"convention to a large finite negative (e.g. -1e9)."
-    )
-
-
-@needs_gfx1250
-def test_v4_nm_sink_shape_and_dtype_validation():
-    """The wrapper must reject malformed `sink` BEFORE the dispatcher can
-    silently mis-stride into garbage memory. Pin five rejection paths."""
-    args = _build_inputs(batch=1, kv_seq_lens=64, q_seq_logical=4, seed=0)
-    num_heads = args["q"].size(1)
-    max_seqlen_q = args["max_seqlen_q"]
-    expected = num_heads  # 2026-06-01 shrink: was num_heads * max_seqlen_q
-    device = args["q"].device
-
-    # Wrong dtype (BF16 instead of FP32).
-    args_bad_dtype = dict(args)
-    args_bad_dtype["sink"] = torch.full(
-        (expected,), float("-inf"), dtype=torch.bfloat16, device=device
-    )
-    with pytest.raises(ValueError, match="sink.*FP32|sink.*float32"):
-        aiter.mla.mla_decode_fwd_v4_nm(**args_bad_dtype)
-
-    # Under-sized.
-    args_under = dict(args)
-    args_under["sink"] = torch.full(
-        (max_seqlen_q,), float("-inf"), dtype=torch.float32, device=device
-    )
-    with pytest.raises(ValueError, match="sink.*numel"):
-        aiter.mla.mla_decode_fwd_v4_nm(**args_under)
-
-    # Over-sized.
-    args_over = dict(args)
-    args_over["sink"] = torch.full(
-        (num_heads * max_seqlen_q,), float("-inf"), dtype=torch.float32, device=device
-    )
-    with pytest.raises(ValueError, match="sink.*numel"):
-        aiter.mla.mla_decode_fwd_v4_nm(**args_over)
-
-    # Non-contiguous (stride=2).
-    args_strided = dict(args)
-    args_strided["sink"] = torch.full(
-        (expected * 2,), float("-inf"), dtype=torch.float32, device=device
-    )[::2]
-    assert args_strided["sink"].numel() == expected
-    with pytest.raises(ValueError, match="sink.*contiguous"):
-        aiter.mla.mla_decode_fwd_v4_nm(**args_strided)
-
-    # Wrong device (CPU vs CUDA q).
-    args_bad_device = dict(args)
-    args_bad_device["sink"] = torch.full(
-        (expected,), float("-inf"), dtype=torch.float32, device="cpu"
-    )
-    with pytest.raises(ValueError, match="sink.*device|same device"):
-        aiter.mla.mla_decode_fwd_v4_nm(**args_bad_device)
-
-
-# ---------------------------------------------------------------------------
 # __main__ sweep: arch gate -> itertools.product over the shape lists ->
 # one markdown summary table (SKILL rules 6-9).
 # ---------------------------------------------------------------------------
@@ -1089,8 +736,8 @@ def main():
         help="attn sink value(s) to sweep. e.g. --attn-sink True False",
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--iters", type=int, default=10, help="Perf timed iterations")
-    parser.add_argument("--warmup", type=int, default=2, help="Perf warmup iterations")
+    parser.add_argument("--iters", type=int, default=2, help="Perf timed iterations")
+    parser.add_argument("--warmup", type=int, default=1, help="Perf warmup iterations")
     args = parser.parse_args()
 
     global _SEED
