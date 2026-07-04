@@ -1273,7 +1273,12 @@ def mla_decode_fwd_v4_nm(
     )
     use_valid_split_count_reduce = int(num_kv_splits > 1)
 
-    aiter.mla_decode_v4_asm(
+    # gfx1250: launch the shipped v4-nm `.co` directly from Python (no `.cu`
+    # host stub). The pure-Python launcher reproduces asm_mla_v4.cu's gfx1250
+    # preload dispatch and issues hipModuleLaunchKernel on the current torch
+    # stream, so it is stream- and CUDA-graph-correct just like the C ABI. All
+    # other arches keep the compiled `aiter.mla_decode_v4_asm` path.
+    stage1_args = (
         q,
         qrope,
         kv_buffer,
@@ -1294,6 +1299,12 @@ def mla_decode_fwd_v4_nm(
         valid_split_count,
         use_valid_split_count_reduce,
     )
+    if get_gfx() == "gfx1250":
+        from aiter.mla_v4_asm_py import mla_decode_v4_asm_py
+
+        mla_decode_v4_asm_py(*stage1_args)
+    else:
+        aiter.mla_decode_v4_asm(*stage1_args)
 
     # ---- Cross-split FlashAttention merge via _fwd_kernel_stage2_asm ------
     if num_kv_splits > 1:
