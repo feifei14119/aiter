@@ -124,6 +124,8 @@ ENABLE_CK=0 python3 -c "import triton.language; import runpy,sys; \
 
 这样同时消除"运行期循环边界"和"跨迭代串行依赖"，逼近 pa 的 ~7us 量级。风险：`NUM_KV_SPLITS` 需 host 已知且各 batch 一致（本次范围仅覆盖常规 decode）；`BLOCK_DV × NUM_KV_SPLITS` 的寄存器/LDS 压力需实测 occupancy（split ≤ 16 有界）。
 
+> **澄清（纠正早期表述）**：buffer 格式（asm 的 2-buffer 归一化 vs gluon 的 3-buffer 未归一化）与"串行 vs 并行合并"是**正交**的。asm 采用串行 online-softmax 递推是独立的实现选择，**不是归一化 / 2-buffer 造成的**——2-buffer 归一化格式一样能并行合并（`m=max_i(lse_i); w_i=exp(lse_i−m); out=Σ w_i·o_i / Σ w_i`）。因此上述改写**无需改动 stage1 输出格式**。
+
 ## 6. 复现口径备注
 
 - 每次改完 kernel，用第 3 节命令复测，直接和第 4 节表对比 `asm_s2` 列。

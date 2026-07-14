@@ -43,6 +43,18 @@ stage1(main kernel)把部分结果写成 **三个张量**：
 
 > 两个 pass 的 stage1 输出布局本质相同(都是 split-major fp32 partials)。**差距不在数据布局，而在 stage2 怎么消费它。**
 
+### 为什么 asm 是 2 个 buffer、gluon 是 3 个(编码差异,非信息差异)
+
+两者存的是**同一份信息的两种编码**(`o_i = acc_i/l_i`,`lse_i = m_i + log(l_i)`):
+
+- **asm(2 buff)**:stage1 就把每 split **归一化**成 `o_i = acc_i/l_i`(存入 `logits`),并把 `m_i,l_i` **折成一个** `lse_i = m_i+log(l_i)`(存入 `attn_lse`)。好处:`num_kv_splits==1` 时 `logits` 直接就是最终输出(`mla.py:282` 令 `logits = o.view(...)`,stage2 走 `FINAL_OUT` 快路免合并);stage2 每 split 少读 1 个 float。代价:stage1 多做 per-split 除法 + `log`。
+- **gluon(3 buff)**:保留**未归一化分子** `acc_i` + 独立 `m_i` + `l_i`(经典 flash-decoding partials)。因为不归一化,`l_i` 折不进 `o_i`,必须单独留,故 3 个。好处:stage1 省除法/`log`,最后只做一次除法(数值更稳、空 split 易 mask),且 2D(m/l)+3D(acc) 正好配 TDM 的 LDS 载入。
+
+> **重要澄清(纠正早期表述):buffer 格式与"串行 vs 并行合并"是正交的两件事。**
+> "asm 做了归一化 / 用 2-buffer" **并不会**逼出串行递推——2-buffer 归一化格式一样能并行合并:
+> `m=max_i(lse_i); w_i=exp(lse_i−m); out=Σ w_i·o_i / Σ w_i`(与 gluon 的 `Σ acc_i·alpha_i / Σ l_i·alpha_i` 可并行性完全一致)。
+> asm 采用串行 online-softmax 递推是**独立的实现选择**(沿用了 flash-attention stage1 的流式写法、便于处理运行期可变 split),不是数据格式造成的。**因此下面建议 1 在不改 stage1 输出格式(仍 2-buffer 归一化)的前提下即可完成。**
+
 ---
 
 ## 2. stage2 的 workload 分配对比
@@ -101,7 +113,7 @@ stage1(main kernel)把部分结果写成 **三个张量**：
 
 ### 建议 1(收益最大):改写为"向量化并行归约"形态,对齐 gluon/flash-decoding
 
-同时消除主因 1、3、4。做法:
+**不改 stage1 输出格式(仍是 2-buffer 归一化 `o_i`+`lse_i`)**,只重写 stage2 的合并算法。同时消除主因 1、3、4。做法:
 1. `NUM_KV_SPLITS` 作 `tl.constexpr` 传入。
 2. 一次 2D `tl.load` 取回 `tv[NUM_KV_SPLITS, BLOCK_DV]` 与 `lse[NUM_KV_SPLITS]`(split 外层、`offs_d` 内层,偏移全静态)。
 3. `seg_active = split_id < num_valid`,把无效 split 的 `lse` 置 `-inf`。
