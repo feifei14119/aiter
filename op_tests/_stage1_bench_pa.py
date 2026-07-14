@@ -36,7 +36,6 @@ import torch
 import test_mla_v4_kargpreld as T
 import aiter, aiter.mla
 from aiter import dtypes
-from aiter.test_common import run_perftest
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 
 Q = 1
@@ -111,9 +110,49 @@ def bench_asm(batch, ctx, gqa, split=1):
     return s1_us, s2_us
 
 
+# pa gluon kernel name hints (as they appear in the profiler):
+#   stage1 split   -> `_pa_decode_sparse`        (contains "sparse")
+#   stage2 reduce  -> `_pa_decode_sparse_reduce` (contains "reduce")
+# Check "reduce" first so it isn't swallowed by the "sparse" bucket.
+_PA_S2_HINT = "reduce"
+_PA_S1_HINT = "sparse"
+
+
+def _profile_pa_stages(fn, iters, warmup):
+    """Directly attribute pa's per-kernel device time via the profiler, so
+    stage2 (reduce) is measured on its own kernel instead of being derived as
+    (full - stage1) — which produced negative/garbage values under GPU
+    contention. Symmetric with asm's `_profile_stage_times`. Returns
+    (pa_s1_us, pa_s2_us). pa_s2_us == 0 when the split==1 (no reduce kernel)."""
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as prof:
+        for _ in range(iters):
+            fn()
+        torch.cuda.synchronize()
+    s1 = s2 = 0.0
+    for ev in prof.events():
+        dev_us = getattr(ev, "self_device_time_total", 0) or 0
+        if dev_us <= 0:
+            continue
+        nm = ev.name.lower()
+        if _PA_S2_HINT in nm:
+            s2 += dev_us
+        elif _PA_S1_HINT in nm:
+            s1 += dev_us
+    return s1 / iters, s2 / iters
+
+
 def bench_pa(batch, ctx, gqa):
-    """Time pa the ATOM way (auto split, full stage1+stage2) and, for context,
-    the same call forced to stage1-only. Returns (pa_s1_us, pa_full_us, split)."""
+    """Time pa the ATOM way (auto split, full stage1+stage2) with a single
+    profiled run, attributing stage1 (split) and stage2 (reduce) device time
+    to their own kernels. Returns (pa_s1_us, pa_s2_us, split)."""
     dev = "cuda"
     D = T.V_HEAD_DIM  # 512
     Tn = batch
@@ -128,25 +167,16 @@ def bench_pa(batch, ctx, gqa):
 
     split = _infer_kv_splits(Tn, H, kv_indices.numel())
 
-    # pa full: EXACTLY ATOM's gfx1250 call — no kv_splits (auto-inferred to
-    # `split`), no skip_reduce => stage1 split + stage2 reduce both run.
-    _, full_us = run_perftest(
-        pa_decode_sparse,
-        q, unified_kv, kv_indices, kv_indptr, attn_sink, sm,
-        has_invalid=False,
-        num_iters=_PERF["num_iters"],
-        num_warmup=_PERF["num_warmup"],
+    # EXACTLY ATOM's gfx1250 call — no kv_splits (auto-inferred to `split`),
+    # no skip_reduce => stage1 split + stage2 reduce both run when split>1.
+    s1_us, s2_us = _profile_pa_stages(
+        lambda: pa_decode_sparse(
+            q, unified_kv, kv_indices, kv_indptr, attn_sink, sm, has_invalid=False
+        ),
+        iters=_PERF["num_iters"],
+        warmup=_PERF["num_warmup"],
     )
-    # pa stage1-only: same split but skip_reduce=True => only the split kernel
-    # (skip_reduce is a no-op when the inferred split==1, so s1==full there).
-    _, s1_us = run_perftest(
-        pa_decode_sparse,
-        q, unified_kv, kv_indices, kv_indptr, attn_sink, sm,
-        kv_splits=split, has_invalid=False, skip_reduce=True,
-        num_iters=_PERF["num_iters"],
-        num_warmup=_PERF["num_warmup"],
-    )
-    return s1_us, full_us, split
+    return s1_us, s2_us, split
 
 
 import itertools
@@ -174,9 +204,11 @@ else:
 # gqa outermost so rows mirror the kargpreld summary-table grouping.
 for gqa, batch, ctx, asm_split in combos:
     asm_s1, asm_s2 = bench_asm(batch, ctx, gqa, asm_split)
-    pa_s1_us, pa_full_us, split = bench_pa(batch, ctx, gqa)
+    pa_s1_us, pa_s2_us, split = bench_pa(batch, ctx, gqa)
     asm_tot = asm_s1 + asm_s2
-    pa_s2_us = pa_full_us - pa_s1_us  # pa stage2 reduce = full - stage1
+    # pa stage2 reduce is now measured directly on its own kernel (profiler
+    # device time), symmetric with asm; total = s1 + s2 (both device times).
+    pa_full_us = pa_s1_us + pa_s2_us
     print(f"{gqa:>4} {batch:>6} {ctx:>6} {asm_split:>9} {split:>8} | "
           f"{asm_s1:>8.2f} {pa_s1_us:>8.2f} {_ratio(pa_s1_us, asm_s1):>9.2f}x | "
           f"{asm_s2:>8.2f} {pa_s2_us:>8.2f} {_ratio(pa_s2_us, asm_s2):>9.2f}x | "
