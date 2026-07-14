@@ -402,7 +402,7 @@ def mla_decode_fwd(
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
             mgc=mgc,
-            num_warps=4,
+            num_warps=1,
             num_stages=2,
             **extra_kargs,
         )
@@ -1335,7 +1335,7 @@ def mla_decode_fwd_v4_nm(
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
             mgc=mgc,
-            num_warps=4,
+            num_warps=1,
             num_stages=2,
             waves_per_eu=4,
         )

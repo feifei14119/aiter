@@ -128,6 +128,43 @@ ENABLE_CK=0 python3 -c "import triton.language; import runpy,sys; \
 
 ## 6. 复现口径备注
 
-- 每次改完 kernel，用第 3 节命令复测，直接和第 4 节表对比 `asm_s2` 列。
-- run-to-run 抖动约 ±1us（如 64/512/4 两次 44.08 / 43.18）。
+- 每次改完 kernel，用第 3 节命令复测，直接和第 7 节干净 baseline 对比 `asm_s2` 列。
 - 对照 pa 为 bf16、asm 为 fp8，且此 bench 用 D=512（MLA QK 实为 576，pa QK 约低估 ~11%）——仅比 stage2 归约耗时时不受影响（stage2 两边都是 fp32 partials 归约）。
+
+---
+
+## 7. 【重要更正】测量环境污染 + 干净 baseline + num_warps 结论
+
+### 7.1 第 4 节的 baseline 作废（GPU 争抢）
+
+第 4 节的表是在**被其它作业争抢的 GPU** 上测的（`rocm-smi` 一度报所有卡 100%，且重启后确认读数有误）。表现出的"`asm_s2` ~42–57us 且与 split/ctx 无关的地板"是**争抢假象，不是 kernel 真实行为**。据此得出的"串行递推是主因"的判断也随之**被证伪**。
+
+### 7.2 干净 baseline（GPU3 独占，2 次取值稳定 ±1us）
+
+命令加 `HIP_VISIBLE_DEVICES=3`。原始 kernel（串行，`num_warps=4`）：干净环境下 **`asm_s2` 随 split 与 nhead 缩放**（work-bound），不再有地板。
+
+| gqa | ctx | split | asm_s2 (nw=4, baseline) | asm_s2 (nw=1) | pa_s2 | nw1 提升 |
+|----:|----:|----:|-----:|-----:|----:|:--|
+| 64 | 256 | 2 | 16.0 | 15.2 | 5.8 | ~5% |
+| 64 | 256 | 4 | 28.7 | 23.7 | 8.9 | ~17% |
+| 64 | 512 | 2 | 14.3 | 13.1 | 5.7 | ~8% |
+| 64 | 512 | 4 | 28.4 | 23.5 | 5.7 | ~17% |
+| 64 | 1024 | 2 | 14.4 | 13.1 | 7.4 | ~9% |
+| 64 | 1024 | 4 | 28.7 | 23.7 | 6.0 | ~17% |
+| 128 | 256 | 2 | 30.6 | 22.6 | 6.7 | ~26% |
+| 128 | 256 | 4 | 41.0 | 24.6 | 6.6 | **~40%** |
+| 128 | 512 | 2 | 30.6 | 22.8 | 7.1 | ~26% |
+| 128 | 512 | 4 | 40.9 | 24.7 | 6.0 | **~40%** |
+| 128 | 1024 | 2 | 30.5 | 22.7 | 5.5 | ~26% |
+| 128 | 1024 | 4 | 39.3 | 24.0 | 6.9 | **~39%** |
+
+### 7.3 真正的杠杆是 `num_warps`（4 → 1），不是串行改向量化
+
+- 干净 GPU3 + cuda-event 对拍：`serial@num_warps=1` 全场 ~12.6us；`serial@num_warps=4` 在大 work 时退化（nhead128/split4 ~28us）。`vec@任意 warps` ~13.4us；**serial 与 vec 在 nw=1 时基本持平**（serial 略快、更简单）。
+- 结论：把两处 `_fwd_kernel_stage2_asm` 启动的 `num_warps` 由 4 改为 1，即得 **nhead64 ~17% / nhead128 ~40%** 的 stage2 提速。`BLOCK_DV=512` 用 4 warp（128 lane，每 lane 仅 4 元素）过度切分；1 warp（32 lane，每 lane 16 元素）ILP 更好、更贴近 gluon reduce 的 `num_warps=1`。
+- **正确性**：`num_warps` 仅改变 D 维在 thread 间的划分，不改变每个输出元素的计算 → 与 nw=4 输出 **bit-identical（max abs diff = 0.0）**，与 torch 参考仅差 bf16 舍入（~0.2%）。零风险。
+
+### 7.4 现状与后续
+
+- 已落地改动：`aiter/mla.py` 两处 stage2 启动 `num_warps=4 → 1`（kernel 主体保持原始串行版）。
+- 仍有差距：`asm_s2` ~13–25us vs pa ~6us（约 2–4×）。后续可试：向量化并行归约（对大 split 更稳）、减少 stage2 的运行期开销（num_valid 计算/分支）、合并 V+lse 访存等——但需继续在**独占 GPU3** 上用同口径测量。

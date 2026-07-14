@@ -92,8 +92,10 @@ stage1(main kernel)把部分结果写成 **三个张量**：
 
 ## 3. 影响性能的因素(按对 asm 的影响从大到小)
 
-1. **运行期循环边界 + 串行 online-softmax 递推(主因)**
-   `num_valid_kv_splits` 由 load 得来 → 循环不可展开；且 `e_max/e_sum/acc` 跨迭代串行依赖，每轮 load→stall→exp→update，访存与 exp 延迟无法在迭代间重叠。对应 baseline 里 **与 split 数/ctx 都无关的 ~45us 地板**。
+> **【更正】** 下列排序基于早期在**被争抢的 GPU** 上的测量，已被推翻。干净 GPU3 复测后：那条"~45us 地板"是争抢假象；stage2 实际随 split/nhead 缩放。经对拍验证，**真正的主因是 `num_warps=4` 对 `BLOCK_DV=512` 的 reduce 过度切分**（每 lane 仅 4 元素、ILP 低）；改 `num_warps=1` 即得 nhead64 ~17% / nhead128 ~40% 提速，且串行 vs 向量化在 nw=1 下基本无差。详见 `mla_stage2_baseline.md` 第 7 节。以下原始因素列表仅作历史参考。
+
+1. **~~运行期循环边界 + 串行 online-softmax 递推(主因)~~（已证伪，见上方更正）**
+   `num_valid_kv_splits` 由 load 得来 → 循环不可展开；且 `e_max/e_sum/acc` 跨迭代串行依赖。曾以为对应 baseline 的 ~45us 地板，实为 GPU 争抢假象。
 2. **无批量 DMA / 无 LDS 暂存**
    asm 每 split 各发一次 global load，延迟逐次暴露；gluon 用 TDM 一次把整块搬进 LDS，延迟只付一次。
 3. **split 维完全不并行**
