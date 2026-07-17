@@ -216,6 +216,11 @@ global→LDS 加载**（语义等价于基础版的"整块进 LDS 再从 LDS 归
 **只 stage 前 `nvalid` 段**（因此无需 §4 第 4 步的 scrub）。LDS 用**动态 shared memory** 在
 launch 时按 `S` 尺寸分配，无需把 `KV_SPLITS`/`D` 作为模板参数。
 
+> stride 参数用 **32-bit `int`**（不是 `long`）：`v_head_dim` 常为 512、`H ≤ 128`、`KV_SPLITS ≤ 64`，
+> 故最大 stride `s_mid_t = S*H*D = 64*128*512 = 4.2M`，远小于 int32 上限（≈2.1e9），可安全用 32 位表示。
+> 地址计算里对索引仍显式 `(long)` 提升（`(long)t * s_mid_t`），保证 `base + index*stride` 走 64 位、无溢出。
+> asm pass 的 kernarg（`AsmStage2KernelArgs`）中对应的 `s_mid_{t,k,h}` 也同为 `int32`。
+
 ```cpp
 // One CTA per (token t, head h); blockDim.x lanes split the D axis.
 __global__ void mla_stage2_lds_kernel(
@@ -224,9 +229,9 @@ __global__ void mla_stage2_lds_kernel(
     __hip_bfloat16* __restrict__ O,            // [tq, H, D]
     const int* __restrict__ valid_split_count, // [tq]
     int S, int D, int mgc, int kv_len, int use_valid_split,
-    long s_mid_t, long s_mid_k, long s_mid_h,
-    long s_lse_t, long s_lse_k, long s_lse_h,
-    long s_out_t, long s_out_h)
+    int s_mid_t, int s_mid_k, int s_mid_h,   // element strides fit in 32b (max S*H*D = 64*128*512 = 4.2M)
+    int s_lse_t, int s_lse_k, int s_lse_h,
+    int s_out_t, int s_out_h)
 {
     const int t = blockIdx.x;
     const int h = blockIdx.y;
@@ -244,8 +249,10 @@ __global__ void mla_stage2_lds_kernel(
     float* s_acc = smem;            // [S*D]
     float* s_lse = smem + S * D;    // [S]
 
-    const float* acc_base = Mid_O   + (long)t * s_mid_t + (long)h * s_mid_h;
-    const float* lse_base = Mid_lse + (long)t * s_lse_t + (long)h * s_lse_h;
+    int acc_offset = t * s_mid_t + h * s_mid_h;
+    float* acc_base = Mid_O   + (long)acc_offset;
+    int lse_offset = t * s_lse_t + h * s_lse_h;
+    float* lse_base = Mid_lse + (long)lse_offset;
 
     // 3. stage the valid partials global -> LDS (design's TDM async bulk-load).
     for (int idx = tid; idx < nvalid * D; idx += nthreads) {
@@ -293,9 +300,9 @@ hipLaunchKernelGGL(mla_stage2_lds_kernel, grid, block, shmem, /*stream=*/0,
     reinterpret_cast<__hip_bfloat16*>(O.data_ptr()),
     valid_split.data_ptr<int>(),
     S, D, (int)mgc, (int)kv_len, (int)use_valid_split,
-    Mid_O.stride(0), Mid_O.stride(1), Mid_O.stride(2),   // s_mid_{t,k,h}
-    Mid_lse.stride(0), Mid_lse.stride(1), Mid_lse.stride(2), // s_lse_{t,k,h}
-    O.stride(0), O.stride(1));                            // s_out_{t,h}
+    (int)Mid_O.stride(0), (int)Mid_O.stride(1), (int)Mid_O.stride(2),      // s_mid_{t,k,h}
+    (int)Mid_lse.stride(0), (int)Mid_lse.stride(1), (int)Mid_lse.stride(2),// s_lse_{t,k,h}
+    (int)O.stride(0), (int)O.stride(1));                                   // s_out_{t,h}
 ```
 
 | 维度 | x | y | z | 说明 |
@@ -402,6 +409,227 @@ __global__ void mla_stage2_tdm_lds_dyn(
 与 §4 基础版的差异仅在**第 1–4 步**：先读 `nvalid` → 描述符 extent 用 `nvalid` → 只搬有效部分 →
 省掉 scrub。归约体、写回、LDS 静态分配都不变。若 `nvalid` 大到 LDS 装不下，仍需结合 §5 的
 chunked 变体（此时"动态 extent"退化为"最后一块的 extent 用余数"）。
+
+---
+
+## 4.2 4-wave 变体（对齐当前 sp3 asm 落地实现）
+
+§4 / §4.0 用的是 **1-wave（32 lane 沿 D 轴）**。当前 sp3 asm kernel
+（`poc_kl/mi400/mla/shaders/mla_fwd_stage2.sp3`）用的是 **4-wave（blockDim=128）** 方案，
+本节补齐其 HIP 伪代码与落地实现，与 sp3 一一对应。
+
+### 与 1-wave 的核心差异
+
+| 维度 | 1-wave（§4） | 4-wave（本节 / 当前 sp3） |
+|---|---|---|
+| `blockDim` | 32（1 wave） | **128**（4 wave × 32） |
+| D 轴分配 | 32 lane，每线程 `512/32 = 16` 元素 | 128 线程，每线程 **`512/128 = 4`** 个连续元素（一笔 `ds_load_b128`/split） |
+| 谁发搬运 | 唯一的 wave | **只有 wave0** 建描述符 + 发 TDM（TDM 是 CTA 级单 DMA 引擎，一个 wave 发即覆盖整块） |
+| LSE 落哪 | LDS `s_lse[k]` | **寄存器**（每 wave 各存一份，lane `l` 存 split `r*32+l`，共 `ceil(KV_SPLITS/32)` 轮），归约时 `__shfl` 广播 |
+| barrier | `__syncthreads()` | 同左（wave1–3 跳过 TDM，必须在 barrier 等 wave0 的 LDS 落地并可见） |
+
+设计动机：
+- **`D=512 / 128 = 4`**：每线程负责 4 个**连续** D 元素，恰好一笔 128-bit 向量 LDS 读
+  （`ds_load_b128`）就读满该线程在一个 split 上的全部数据；128 线程一笔即覆盖整行 `Lv=512`。
+  （注意 D 元素分配是 `d0 = tid*4` 的**连续 4 元素**，不同于 §4 的 `d = tid; d += nthreads`
+  跨步分配——这是为了对齐 `ds_load_b128` 的连续读。）
+- **只 wave0 发 TDM**：整块 `[nvalid, D]` 一次描述符搬完，让 4 个 wave 都发是冗余（甚至重复搬）；
+  其余 wave 直接到 barrier 等。
+- **LSE 进寄存器而非 LDS**：per-split lse 是标量、量小，放寄存器省 LDS、省一次 LDS 往返。
+  代价是归约时线程要取任意 split `k` 的 lse，需 wave 内 `__shfl` 广播（所有 wave 都存了同一份，
+  故每个 wave 内部自洽）。
+- **`e_max`/`e_sum` 是每线程标量**：online-softmax 的 `e_max`/`e_sum` 只依赖 `lse[k]` 序列、
+  与 d 无关，故一个线程的 4 个 D 元素**共享**同一 `e_max`/`e_sum`，只有 `acc[4]` 按 d 分开。
+
+### HIP 伪代码
+
+```cpp
+template <int KV_SPLITS, int D = 512, int NUM_WARPS = 4>   // 4 wave = 128 lane
+__global__ void mla_stage2_tdm_lds_4wave(
+    const float* __restrict__ Mid_O,     // [total_q, KV_SPLITS, H, D]
+    const float* __restrict__ Mid_lse,   // [total_q, KV_SPLITS, H, 1]
+    __hip_bfloat16* __restrict__ O,      // [total_q, H, D]
+    const int* __restrict__ kv_indptr,
+    const int* __restrict__ valid_split_count,
+    int USE_VALID_SPLIT_COUNT_REDUCE, int H, int mgc,
+    long s_mid_t, long s_mid_k, long s_mid_h,
+    long s_lse_t, long s_lse_k, long s_lse_h,
+    long s_out_t, long s_out_h)
+{
+    constexpr int WSIZE       = 32;
+    constexpr int NTHREADS    = NUM_WARPS * WSIZE;              // 128
+    constexpr int DPT         = D / NTHREADS;                   // 4 个 D 元素/线程
+    constexpr int LSE_NROUNDS = (KV_SPLITS + WSIZE - 1) / WSIZE;// lse 存寄存器的轮数
+
+    const int t = blockIdx.x, h = blockIdx.y;
+    const int tid = threadIdx.x;                               // 0..127
+    const int wave = tid >> 5, lane = tid & (WSIZE - 1);
+
+    // 1. nvalid（与 asm 同逻辑）
+    int kv_len = kv_indptr[t + 1] - kv_indptr[t];
+    int nvalid = min(KV_SPLITS, (kv_len + mgc - 1) / mgc);
+    if (USE_VALID_SPLIT_COUNT_REDUCE) nvalid = min(nvalid, valid_split_count[t]);
+    if (nvalid < 0) nvalid = 0;
+
+    // 2. LDS 只放 logits（lse 进寄存器，不占 LDS）
+    __shared__ float s_acc[KV_SPLITS][D];
+    const float* acc_base = Mid_O   + (long)t * s_mid_t + (long)h * s_mid_h;
+    const float* lse_base = Mid_lse + (long)t * s_lse_t + (long)h * s_lse_h;
+
+    // 3. 只有 wave0 建描述符 + 发 TDM，把 [nvalid, D] 整块搬进 LDS
+    if (wave == 0) {
+        auto acc_desc = tdm_make_descriptor_2d(
+            acc_base, /*shape=*/{nvalid, D}, /*strides=*/{s_mid_k, 1}, /*tile=*/{nvalid, D});
+        tdm_async_load(acc_desc, /*offsets=*/{0, 0}, &s_acc[0][0]);
+        tdm_async_wait(0);
+    }
+
+    // 4. 所有 wave 把 per-split lse 存进寄存器（每 wave 一份；lane l 存 split r*32+l）
+    float lse_reg[LSE_NROUNDS];
+    #pragma unroll
+    for (int r = 0; r < LSE_NROUNDS; ++r) {
+        int k = r * WSIZE + lane;
+        lse_reg[r] = (k < nvalid) ? lse_base[(long)k * s_lse_k] : -INFINITY;
+    }
+
+    // 5. barrier：wave1-3 跳过了 TDM，必须在此等 wave0 的 LDS 落地且对全 block 可见
+    __syncthreads();
+
+    // 6. 归约：每线程负责 4 个连续 D 元素 d0..d0+3；沿 split 做 online-softmax
+    const int d0 = tid * DPT;                     // 本线程的第一个 D 元素
+    float e_max = -INFINITY, e_sum = 0.f;
+    float acc[DPT];
+    #pragma unroll
+    for (int i = 0; i < DPT; ++i) acc[i] = 0.f;
+
+    for (int k = 0; k < nvalid; ++k) {
+        // lse[k] 分散在各 lane 的寄存器里：从本 wave 的 lane (k%32) 广播
+        float lse = __shfl(lse_reg[k >> 5], k & (WSIZE - 1));
+        float nm  = fmaxf(lse, e_max);
+        float sc  = __expf(e_max - nm);
+        float p   = __expf(lse - nm);
+        // 一笔 128-bit LDS 读拿到本 split 的 4 个 D 元素（sp3 里就是 ds_load_b128）
+        #pragma unroll
+        for (int i = 0; i < DPT; ++i) {
+            float tv = s_acc[k][d0 + i];
+            acc[i]   = acc[i] * sc + p * tv;
+        }
+        e_sum = e_sum * sc + p;                    // e_max/e_sum 与 d 无关，4 元素共享
+        e_max = nm;
+    }
+
+    // 7. 归一化 + bf16 写回
+    float inv = (e_sum > 0.f) ? (1.f / e_sum) : 0.f;
+    __hip_bfloat16* out = O + (long)t * s_out_t + (long)h * s_out_h + d0;
+    #pragma unroll
+    for (int i = 0; i < DPT; ++i) out[i] = __float2bfloat16(acc[i] * inv);
+}
+```
+
+### 落地实现（协作式 global→LDS，可编译/可运行）
+
+对齐 §4.0：把 `tdm_*` 内建换成协作式 global→LDS，LSE 进寄存器 + `__shfl` 广播，只 stage 前
+`nvalid` 段免 scrub，LDS 走动态 shared。与 sp3 的对应关系逐行标在注释里。
+
+```cpp
+// 4-wave: one CTA per (token t, head h); 128 lanes split D=512 (4 contiguous elems/lane).
+template <int NUM_WARPS = 4>
+__global__ void mla_stage2_lds_kernel_4wave(
+    const float* __restrict__ Mid_O,           // [tq, S, H, D]
+    const float* __restrict__ Mid_lse,         // [tq, S, H, 1]
+    __hip_bfloat16* __restrict__ O,            // [tq, H, D]
+    const int* __restrict__ valid_split_count, // [tq]
+    int S, int D, int mgc, int kv_len, int use_valid_split,
+    int s_mid_t, int s_mid_k, int s_mid_h,     // element strides fit in 32b
+    int s_lse_t, int s_lse_k, int s_lse_h,
+    int s_out_t, int s_out_h)
+{
+    constexpr int WSIZE = 32;
+    constexpr int MAX_KV_SPLITS = 128;                    // sp3 假定 split < 128
+    const int nthreads = NUM_WARPS * WSIZE;              // 128
+    const int t = blockIdx.x, h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5, lane = tid & (WSIZE - 1);
+
+    int nvalid = min(S, (kv_len + mgc - 1) / mgc);
+    if (use_valid_split) nvalid = min(nvalid, valid_split_count[t]);
+    if (nvalid < 0) nvalid = 0;
+
+    extern __shared__ float s_acc[];                     // [S*D]（lse 不占 LDS）
+    const float* acc_base = Mid_O   + (long)t * s_mid_t + (long)h * s_mid_h;
+    const float* lse_base = Mid_lse + (long)t * s_lse_t + (long)h * s_lse_h;
+
+    // 3. 只让 wave0 把 [nvalid, D] 搬进 LDS（对齐 sp3 的单-wave TDM）。
+    //    注：真实 TDM 是 DMA 引擎、wave0 仅"发起"，几乎零占用；这里的协作式 copy 若也只用
+    //    wave0 的 32 lane 会浪费另外 96 lane —— 纯 HIP fallback 通常改用全 128 线程搬（此时
+    //    "只 wave0"的区分消失）。保留 if(wave==0) 只为语义对齐 sp3。
+    if (wave == 0) {
+        for (int idx = lane; idx < nvalid * D; idx += WSIZE) {
+            int k = idx / D, d = idx - k * D;
+            s_acc[idx] = acc_base[(long)k * s_mid_k + d];
+        }
+    }
+
+    // 4. 所有 wave 把 per-split lse 存进寄存器（lane l -> split r*32+l）
+    const int LSE_NROUNDS = (S + WSIZE - 1) / WSIZE;
+    float lse_reg[(MAX_KV_SPLITS + WSIZE - 1) / WSIZE];  // 上限 4 轮（split < 128）
+    for (int r = 0; r < LSE_NROUNDS; ++r) {
+        int k = r * WSIZE + lane;
+        lse_reg[r] = (k < nvalid) ? lse_base[(long)k * s_lse_k] : -INFINITY;
+    }
+
+    __syncthreads();                                     // wave1-3 等 wave0 的 LDS 落地
+
+    // 6-7. 128 线程沿 D（4 连续元素/线程）归约 + bf16 写回
+    const int DPT = D / nthreads;                        // 4（要求 D % 128 == 0，Lv=512 恒成立）
+    const int d0  = tid * DPT;
+    float e_max = -INFINITY, e_sum = 0.f;
+    float acc[8];  for (int i = 0; i < DPT; ++i) acc[i] = 0.f;
+
+    for (int k = 0; k < nvalid; ++k) {
+        float lse = __shfl(lse_reg[k >> 5], k & (WSIZE - 1));   // wave 内广播 split k 的 lse
+        float nm  = fmaxf(lse, e_max);
+        float sc  = __expf(e_max - nm), p = __expf(lse - nm);
+        for (int i = 0; i < DPT; ++i)
+            acc[i] = acc[i] * sc + p * s_acc[(long)k * D + d0 + i];
+        e_sum = e_sum * sc + p;
+        e_max = nm;
+    }
+    float inv = (e_sum > 0.f) ? (1.f / e_sum) : 0.f;
+    __hip_bfloat16* out = O + (long)t * s_out_t + (long)h * s_out_h + d0;
+    for (int i = 0; i < DPT; ++i) out[i] = __float2bfloat16(acc[i] * inv);
+}
+```
+
+**launch 配置**：
+
+```cpp
+constexpr int NUM_WARPS = 4;
+dim3 grid (/*x=*/tq, /*y=*/H, /*z=*/1);               // 一个 CTA = 一个 (token, head)
+dim3 block(/*x=*/NUM_WARPS * 32, /*y=*/1, /*z=*/1);   // 128 lane = 4 wave
+size_t shmem = (size_t)S * D * sizeof(float);         // 只有 s_acc（lse 进寄存器，不占 LDS）
+
+hipLaunchKernelGGL(mla_stage2_lds_kernel_4wave<NUM_WARPS>, grid, block, shmem, /*stream=*/0,
+    Mid_O.data_ptr<float>(), Mid_lse.data_ptr<float>(),
+    reinterpret_cast<__hip_bfloat16*>(O.data_ptr()),
+    valid_split.data_ptr<int>(),
+    S, D, (int)mgc, (int)kv_len, (int)use_valid_split,
+    (int)Mid_O.stride(0), (int)Mid_O.stride(1), (int)Mid_O.stride(2),
+    (int)Mid_lse.stride(0), (int)Mid_lse.stride(1), (int)Mid_lse.stride(2),
+    (int)O.stride(0), (int)O.stride(1));
+```
+
+| 维度 | x | y | z | 说明 |
+|------|---|---|---|------|
+| **grid**  | `total_q` | `H`（`BLOCK_H=1`） | `1` | 每个 CTA 负责一个 `(token, head)` |
+| **block** | `4 * 32 = 128`（4 wave） | `1` | `1` | 沿 D 轴切 128 线程；`D/128 = 4` 连续元素/线程 |
+| **LDS**   | `S*D*4B` 动态分配（**仅 `s_acc`**，lse 进寄存器） | — | — | `S=2` → 4KiB；`S=32` → 64KiB（见 §3.5，需 chunk） |
+
+> 与 sp3 的对应：wave0-only 搬运 ↔ sp3 `s_cmp_eq_u32 s_wave_id,0` 分支后的 `tensor_load_to_lds`；
+> lse 进寄存器 ↔ sp3 的 `global_load_dword` per-lane 多轮加载到 `v_lse[r]`；`__syncthreads()` ↔
+> sp3 的 `s_barrier_signal/-wait`；每线程 4 连续元素一笔读 ↔ sp3 的 `ds_load_b128`；split 循环 ↔
+> sp3 的 `l_split_loop`（自减 `s_loop_cnt`、借位下溢跳出）。当前 sp3 已落到"barrier + 逐 split 从
+> LDS 读一整行 Lv"这一步；`__shfl` 广播 lse 与 online-softmax 归约体是 sp3 的下一步（尚未实现）。
 
 ---
 
