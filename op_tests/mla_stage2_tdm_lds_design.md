@@ -203,6 +203,206 @@ __global__ void mla_stage2_tdm_lds(
 - 第 5 步的 split 循环全部命中 LDS，取代了 asm 的逐 split global 往返——这是提速的关键。
 - `e_max/e_sum` 每线程各算一份（标量、重复但廉价），避免跨线程 reduce。
 
+> **搬运大小 vs 归约边界是两件事**：上面的基础版用编译期 `KV_SPLITS` 建描述符、**整块搬**，
+> 只靠"归约循环停在 `nvalid`"来忽略无效 split（多搬的行不会被读，无 NaN 风险，只浪费带宽）。
+> 这与 gluon 的 "load-all + mask" 一致。若无效 split 很常见，见 §4.1 的动态裁剪变体。
+
+### 4.0 落地实现（真实可编译/可运行的 HIP，`test_mla_stage2_func.py`）
+
+上面的伪代码里 `tdm_*` 是占位符（gfx1250 tensor-DMA 内建名称待与 ROCm/LLVM 头文件核对）。
+下面是**已在 `poc_kl/mi400/mla/pytst/test_mla_stage2_func.py` 中实际编译、启动、并通过
+正确性校验**（split=2/4/8/16，`err=0`）的版本：把 §4 的 TDM 异步整块搬运替换为**协作式
+global→LDS 加载**（语义等价于基础版的"整块进 LDS 再从 LDS 归约"），并直接采用 §4.1 的做法
+**只 stage 前 `nvalid` 段**（因此无需 §4 第 4 步的 scrub）。LDS 用**动态 shared memory** 在
+launch 时按 `S` 尺寸分配，无需把 `KV_SPLITS`/`D` 作为模板参数。
+
+```cpp
+// One CTA per (token t, head h); blockDim.x lanes split the D axis.
+__global__ void mla_stage2_lds_kernel(
+    const float* __restrict__ Mid_O,           // [tq, S, H, D]
+    const float* __restrict__ Mid_lse,         // [tq, S, H, 1]
+    __hip_bfloat16* __restrict__ O,            // [tq, H, D]
+    const int* __restrict__ valid_split_count, // [tq]
+    int S, int D, int mgc, int kv_len, int use_valid_split,
+    long s_mid_t, long s_mid_k, long s_mid_h,
+    long s_lse_t, long s_lse_k, long s_lse_h,
+    long s_out_t, long s_out_h)
+{
+    const int t = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    // 1. valid split count (same logic as the asm / triton candidates).
+    int nvalid = min(S, (kv_len + mgc - 1) / mgc);
+    if (use_valid_split) nvalid = min(nvalid, valid_split_count[t]);
+    if (nvalid < 0) nvalid = 0;
+
+    // 2. LDS scratch: s_acc[S*D] then s_lse[S] (statically sized for S; only the
+    //    first nvalid rows are used). Sized at launch via dynamic shared memory.
+    extern __shared__ float smem[];
+    float* s_acc = smem;            // [S*D]
+    float* s_lse = smem + S * D;    // [S]
+
+    const float* acc_base = Mid_O   + (long)t * s_mid_t + (long)h * s_mid_h;
+    const float* lse_base = Mid_lse + (long)t * s_lse_t + (long)h * s_lse_h;
+
+    // 3. stage the valid partials global -> LDS (design's TDM async bulk-load).
+    for (int idx = tid; idx < nvalid * D; idx += nthreads) {
+        int k = idx / D;
+        int d = idx - k * D;
+        s_acc[idx] = acc_base[(long)k * s_mid_k + d];
+    }
+    for (int k = tid; k < nvalid; k += nthreads)
+        s_lse[k] = lse_base[(long)k * s_lse_k];
+    __syncthreads();
+
+    // 5-6. online-softmax reduce over splits (all LDS), normalize, bf16 write-back.
+    for (int d = tid; d < D; d += nthreads) {
+        float e_max = -INFINITY, e_sum = 0.f, acc = 0.f;
+        for (int k = 0; k < nvalid; ++k) {
+            float lse = s_lse[k];
+            float tv  = s_acc[(long)k * D + d];
+            float nm  = fmaxf(lse, e_max);
+            float sc  = __expf(e_max - nm);
+            float p   = __expf(lse - nm);
+            acc   = acc * sc + p * tv;
+            e_sum = e_sum * sc + p;
+            e_max = nm;
+        }
+        float out = (e_sum > 0.f) ? (acc / e_sum) : 0.f;
+        O[(long)t * s_out_t + (long)h * s_out_h + d] = __float2bfloat16(out);
+    }
+}
+```
+
+**launch 配置（grid / block 的 x/y/z + 动态 LDS）**：
+
+```cpp
+const int tq = Mid_O.size(0);   // total_q（token 数）
+const int S  = Mid_O.size(1);   // KV_SPLITS
+const int H  = Mid_O.size(2);   // head 数
+const int D  = Mid_O.size(3);   // v_head_dim = 512
+
+dim3 grid (/*x=*/tq,            /*y=*/H, /*z=*/1);   // 一个 CTA = 一个 (token, head)
+dim3 block(/*x=*/num_warps * 32,/*y=*/1, /*z=*/1);   // BLOCK_H=1；lanes 沿 D 轴
+size_t shmem = (size_t)(S * D + S) * sizeof(float);  // s_acc[S*D] + s_lse[S]
+
+hipLaunchKernelGGL(mla_stage2_lds_kernel, grid, block, shmem, /*stream=*/0,
+    Mid_O.data_ptr<float>(), Mid_lse.data_ptr<float>(),
+    reinterpret_cast<__hip_bfloat16*>(O.data_ptr()),
+    valid_split.data_ptr<int>(),
+    S, D, (int)mgc, (int)kv_len, (int)use_valid_split,
+    Mid_O.stride(0), Mid_O.stride(1), Mid_O.stride(2),   // s_mid_{t,k,h}
+    Mid_lse.stride(0), Mid_lse.stride(1), Mid_lse.stride(2), // s_lse_{t,k,h}
+    O.stride(0), O.stride(1));                            // s_out_{t,h}
+```
+
+| 维度 | x | y | z | 说明 |
+|------|---|---|---|------|
+| **grid**  | `total_q` | `H`（`= cdiv(num_heads, BLOCK_H)`，`BLOCK_H=1`） | `1` | 每个 CTA 负责一个 `(token, head)` |
+| **block** | `num_warps * 32`（默认 `num_warps=1` → 32） | `1` | `1` | 沿 D 轴切线程；`D/blockDim.x` 元素/线程 |
+| **LDS**   | `(S*D + S) * 4B` 动态分配 | — | — | `S=2,D=512` → ~4KiB；`S=32` → 64KiB（见 §3.5，需 chunk） |
+
+> 与伪代码的差异：① 用协作式 global→LDS 取代 `tdm_*` 内建；② 只搬 `nvalid` 段、省掉 scrub；
+> ③ LDS 走动态 shared，`S`/`D` 作为运行期参数而非模板常量。归约体、写回、`(token,head)`→CTA
+> 的映射与 §4 完全一致。编译走 `torch.utils.cpp_extension.load_inline`（hipcc，`--offload-arch=gfx1250`）。
+
+---
+
+## 4.1 变体：按 `nvalid` 动态裁剪 TDM 搬运（USE_VALID_SPLIT_COUNT_REDUCE / 稀疏场景）
+
+### 动机
+基础版无论实际有效几段，都按 `KV_SPLITS` 整块搬。当 stage1 是稀疏、很多 split 早退时
+（对应 asm 的 `USE_VALID_SPLIT_COUNT_REDUCE=1`，`valid_split_count[t]` 常 `<< KV_SPLITS`），
+可以**先读出运行期有效段数 `nvalid`，再把 TDM 描述符的 extent 设成 `nvalid`，只搬有效部分**，
+省下无用带宽，同时归约无需再 scrub。
+
+### 与基础版的差别（关键三点）
+1. **多一次前置标量 load**：先把 `valid_split_count[t]` 读回来算 `nvalid`。这形成一条
+   "标量 load → 建描述符 → 发 TDM" 的**串行依赖**（几百 cycle）——这正是 gluon 选择"全搬+掩码"
+   以避免的东西。可把这次 load 尽量提前、与其它 setup（算 offset、读 sink）重叠来削弱代价。
+2. **描述符 extent 用运行期 `nvalid`**（不再是编译期 `KV_SPLITS`）。TDM 硬件描述符支持运行期
+   维度；具体 API 是否接受运行期 shape 需按 ROCm/LLVM 头文件确认。
+3. **LDS 仍按编译期 `KV_SPLITS` 静态分配**（`__shared__` 大小必须是常量），只是**用前 `nvalid` 行**。
+
+### 何时用
+- **稀疏 / `nvalid` 经常远小于 `KV_SPLITS`** → 省下的带宽 > 串行开销，**用本变体**。
+- **密集 / `nvalid ≈ KV_SPLITS` 是常态** → 基础版"全搬+掩码"更简单、DMA 更早发、大小静态可预测，
+  多搬的少量数据可忽略，**用 §4 基础版**。
+- 注意 `nvalid` 也被 `cdiv(kv_len, mgc)` 限制，所以即使不开 `USE_VALID_SPLIT_COUNT_REDUCE`，
+  序列不够长时本变体（用 `min(KV_SPLITS, cdiv(kv_len,mgc))`）一样能省带宽。
+
+### HIP 伪代码（在 §4 基础版上的增量改动）
+
+```cpp
+template <int KV_SPLITS, int D, int NUM_WARPS>
+__global__ void mla_stage2_tdm_lds_dyn(
+    const float* __restrict__ Mid_O,     // [total_q, KV_SPLITS, H, D]
+    const float* __restrict__ Mid_lse,   // [total_q, KV_SPLITS, H, 1]
+    __hip_bfloat16* __restrict__ O,      // [total_q, H, D]
+    const int*   __restrict__ kv_indptr,
+    const int*   __restrict__ valid_split_count,   // [total_q]，stage1 写入
+    int USE_VALID_SPLIT_COUNT_REDUCE, int H, int mgc,
+    long s_mid_t, long s_mid_k, long s_mid_h,
+    long s_lse_t, long s_lse_k, long s_lse_h,
+    long s_out_t, long s_out_h)
+{
+    const int t = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int nthreads = NUM_WARPS * 32;
+
+    // --- 1. 先算运行期有效段数 nvalid（比基础版更早、结果驱动搬运大小）------
+    int kv_len = kv_indptr[t + 1] - kv_indptr[t];
+    int nvalid = min(KV_SPLITS, (kv_len + mgc - 1) / mgc);   // cdiv 上界
+    if (USE_VALID_SPLIT_COUNT_REDUCE)
+        nvalid = min(nvalid, valid_split_count[t]);          // ← 前置标量 load
+    // 提示：把上面这次 load 与下面的 offset/sink setup 交错，隐藏其延迟。
+
+    // --- 2. LDS 仍按编译期 KV_SPLITS 静态分配，只用前 nvalid 行 ------------
+    __shared__ float s_acc[KV_SPLITS][D];
+    __shared__ float s_lse[KV_SPLITS];
+
+    // --- 3. 描述符 extent 用运行期 nvalid，只搬有效部分 -------------------
+    const float* acc_base = Mid_O   + t * s_mid_t + h * s_mid_h;
+    const float* lse_base = Mid_lse + t * s_lse_t + h * s_lse_h;
+
+    auto acc_desc = tdm_make_descriptor_2d(
+        /*base=*/acc_base,
+        /*shape=*/{nvalid, D},          // ← 运行期，而非 {KV_SPLITS, D}
+        /*strides=*/{s_mid_k, 1},
+        /*tile=*/{nvalid, D});
+    auto lse_desc = tdm_make_descriptor_1d(
+        /*base=*/lse_base, /*shape=*/{nvalid}, /*strides=*/{s_lse_k}, /*tile=*/{nvalid});
+
+    tdm_async_load(acc_desc, /*offsets=*/{0, 0}, &s_acc[0][0]);  // 仅 nvalid*D
+    tdm_async_load(lse_desc, /*offsets=*/{0},    &s_lse[0]);
+    tdm_async_wait(/*outstanding=*/0);
+    __syncthreads();
+
+    // --- 4. 无需 scrub：只搬了有效数据，直接归约 [0, nvalid) --------------
+    for (int d = tid; d < D; d += nthreads) {
+        float e_max = -INFINITY, e_sum = 0.f, acc = 0.f;
+        for (int k = 0; k < nvalid; ++k) {          // 全命中 LDS
+            float lse = s_lse[k];
+            float tv  = s_acc[k][d];
+            float nm  = fmaxf(lse, e_max);
+            float sc  = __expf(e_max - nm), p = __expf(lse - nm);
+            acc   = acc * sc + p * tv;
+            e_sum = e_sum * sc + p;
+            e_max = nm;
+        }
+        float out = (e_sum > 0.f) ? (acc / e_sum) : 0.f;
+        O[t * s_out_t + h * s_out_h + d] = __float2bfloat16(out);
+    }
+}
+```
+
+与 §4 基础版的差异仅在**第 1–4 步**：先读 `nvalid` → 描述符 extent 用 `nvalid` → 只搬有效部分 →
+省掉 scrub。归约体、写回、LDS 静态分配都不变。若 `nvalid` 大到 LDS 装不下，仍需结合 §5 的
+chunked 变体（此时"动态 extent"退化为"最后一块的 extent 用余数"）。
+
 ---
 
 ## 5. HIP 伪代码（chunked over split：大 split / 控 LDS 占用）
