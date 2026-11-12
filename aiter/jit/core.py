@@ -9,6 +9,7 @@ import multiprocessing
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -22,7 +23,12 @@ from packaging.version import Version, parse
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
 from chip_info import _detect_native, get_gfx, get_gfx_list, get_gfx_runtime
-from cpp_extension import _jit_compile, executable_path, get_hip_version
+from cpp_extension import (
+    _find_rocm_home,
+    _jit_compile,
+    executable_path,
+    get_hip_version,
+)
 from file_baton import FileBaton
 from jit_cache import (
     atomic_copy,
@@ -1385,6 +1391,144 @@ def _cluster_launch_target(detect_gfx) -> bool:
     return _targets_gfx1250(detect_gfx)
 
 
+_ASM_ARCH_DIR_RE = re.compile(r"gfx[0-9a-z]+(?:-[0-9a-z]+)*")
+
+
+def _is_asm_module(srcs) -> bool:
+    """A module whose sources are all LLVM asm builds code objects, not a .so."""
+    return bool(srcs) and all(str(src).endswith(".s") for src in srcs)
+
+
+def asm_co_path(md_name: str, arch: str) -> str:
+    return os.path.join(get_user_jit_dir(), f"{md_name}.{arch}.co")
+
+
+def _asm_srcs_for_arch(srcs, arch: str) -> list:
+    # A source under a gfx* directory (csrc/asm/<arch>/...) is assembled only
+    # for that arch; one outside every gfx* directory, for each target arch.
+    picked = []
+    for src in srcs:
+        dirs = [
+            d
+            for d in os.path.normpath(str(src)).split(os.sep)[:-1]
+            if _ASM_ARCH_DIR_RE.fullmatch(d)
+        ]
+        if not dirs or arch in dirs:
+            picked.append(src)
+    return picked
+
+
+def _asm_target_archs(srcs) -> list[str]:
+    return [a for a in _build_archs_from_env(get_gfx) if _asm_srcs_for_arch(srcs, a)]
+
+
+def _asm_clang() -> str:
+    candidates = [os.environ.get("HIP_CLANG_PATH")]
+    rocm_home = _find_rocm_home()
+    if rocm_home:
+        candidates.append(os.path.join(rocm_home, "lib", "llvm", "bin"))
+    for cand in candidates:
+        if cand and os.path.isfile(os.path.join(cand, "clang")):
+            return os.path.join(cand, "clang")
+    raise RuntimeError(
+        "asm modules need ROCm's clang; set HIP_CLANG_PATH to its directory"
+    )
+
+
+def _build_asm_module(md_name, srcs, flags_extra_hip, extra_include, build_after_wait):
+    """Assemble an all-.s module into one code object per target arch.
+
+    Each .s is a complete kernel (code, .amdhsa_kernel and .amdgpu_metadata);
+    nothing is generated. flags_extra_hip go to clang (e.g. -Wa,-defsym,N=V).
+    """
+    os.makedirs(bd_dir, exist_ok=True)
+    lock_path = f"{bd_dir}/lock_{md_name}"
+    startTS = time.perf_counter()
+
+    def MainFunc():
+        archs = _asm_target_archs(srcs)
+        if not archs:
+            logger.info(f"skip build [{md_name}]: no asm sources for the target archs")
+            return
+        clang = _asm_clang()
+        opbd_dir = f"{bd_dir}/{md_name}/build"
+        os.makedirs(opbd_dir, exist_ok=True)
+        includes = sorted({os.path.dirname(str(s)) for s in srcs} | set(extra_include))
+        for arch in archs:
+            co_path = asm_co_path(md_name, arch)
+            if AITER_REBUILD:
+                try:
+                    os.remove(co_path)
+                except FileNotFoundError:
+                    pass
+            built = f"{opbd_dir}/{md_name}.{arch}.co"
+            cmd = [
+                clang,
+                "-x",
+                "assembler",
+                "-target",
+                "amdgcn-amd-amdhsa",
+                f"-mcpu={arch}",
+                "-Wno-unused-command-line-argument",
+                *(f"-I{inc}" for inc in includes),
+                *flags_extra_hip,
+                *map(str, _asm_srcs_for_arch(srcs, arch)),
+                "-o",
+                built,
+            ]
+            logger.info(f"start build [{md_name}] for {arch} under {opbd_dir}")
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"[aiter] build [{md_name}] for {arch} failed:\n"
+                    f"{' '.join(cmd)}\n{proc.stderr}"
+                )
+            atomic_copy(built, co_path)
+
+    def FinalFunc():
+        logger.info(
+            f"[pid={os.getpid()} pname={multiprocessing.current_process().name}] "
+            f"\033[32mfinish build [{md_name}], cost {time.perf_counter() - startTS:.1f}s \033[0m"
+        )
+
+    mp_lock(
+        lockPath=lock_path,
+        MainFunc=MainFunc,
+        FinalFunc=FinalFunc,
+        build_after_wait=build_after_wait,
+    )
+
+
+__asm_modules: dict[str, dict[str, str]] = {}
+
+
+def get_asm_module(md_name: str) -> dict[str, str]:
+    """Code object path per target arch of an asm module, built on first use."""
+    cos = __asm_modules.get(md_name)
+    if cos is not None:
+        return cos
+    d_args = get_args_of_build(md_name)
+    srcs = d_args["srcs"]
+    if not _is_asm_module(srcs):
+        raise ValueError(f"[{md_name}] is not an asm module: srcs must all be .s files")
+    archs = _asm_target_archs(srcs)
+    if not archs:
+        raise RuntimeError(
+            f"[{md_name}] has no asm sources for target archs "
+            f"{_build_archs_from_env(get_gfx)}"
+        )
+    cos = {arch: asm_co_path(md_name, arch) for arch in archs}
+    rebuild = AITER_REBUILD and md_name not in rebuilded_list
+    if rebuild or not all(os.path.isfile(p) for p in cos.values()):
+        if rebuild:
+            rebuilded_list.append(md_name)
+        _build_asm_module(
+            md_name, srcs, d_args["flags_extra_hip"], d_args["extra_include"], False
+        )
+    __asm_modules[md_name] = cos
+    return cos
+
+
 def build_module(
     md_name,
     srcs,
@@ -1402,6 +1546,10 @@ def build_module(
     flags_extra_hip_per_source=None,
     build_after_wait=False,
 ):
+    if _is_asm_module(srcs):
+        return _build_asm_module(
+            md_name, srcs, flags_extra_hip, extra_include, build_after_wait
+        )
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
@@ -2316,6 +2464,15 @@ def compile_ops(
                 return ctypes_wrapper(*args, **kwargs)
 
             return ctypes_custom_wrapper
+
+        elif ffi_type == "asm":
+            # The decorated function is a stub; calling it returns the module's
+            # {arch: co_path}, assembled on first call.
+            @functools.wraps(func)
+            def asm_wrapper(*args, **kwargs):
+                return get_asm_module(_md_name)
+
+            return asm_wrapper
 
         elif ffi_type == "pybind":
             func.arg_checked = False

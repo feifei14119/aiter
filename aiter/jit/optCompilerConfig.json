@@ -480,6 +480,18 @@
             "f'{AITER_META_DIR}/hsa/codegen.py -m a16w8gemm --output_dir {{}}'"
         ]
     },
+    "module_vector_add_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/asm/gfx1250/vector_add/vector_add.s'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_gemm_a4w4_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gemm_a4w4.cu'"

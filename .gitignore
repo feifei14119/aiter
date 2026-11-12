@@ -27,6 +27,7 @@ aiter/install_mode
 # Compiled Dynamic libraries
 *.so
 *.so.*
+aiter/jit/*.co
 *.dylib
 *.dll
 *.pyd
